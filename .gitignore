@@ -1,0 +1,16 @@
+.agents
+.vscode
+__pycache__
+*.pyc
+*.pyo
+# Ignore .env file containing sensitive information
+.env
+.idea
+.DS_Store
+*.log   
+.claude
+.envrc
+*node_modules/
+*.venv/
+*__pycache__/
+*.pytest_cache/
