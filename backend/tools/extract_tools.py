@@ -13,6 +13,157 @@ from backend.core.config import get_settings
 
 _settings = get_settings()
 
+# ── Translation cache ────────────────────────────────────────────────────────
+_translation_cache: dict[str, str] = {}
+
+
+def _translate(text: str, src: str, dest: str = "en") -> str:
+    if not text or src in ("en", "id", "unknown", ""):
+        return text
+    key = f"{src}:{text[:200]}"
+    if key in _translation_cache:
+        return _translation_cache[key]
+    try:
+        from deep_translator import GoogleTranslator
+        result = GoogleTranslator(source="auto", target=dest).translate(text[:500]) or text
+        _translation_cache[key] = result
+        return result
+    except Exception as e:
+        logger.debug(f"[TRANSLATE] {src}→{dest} failed: {e}")
+        return text
+
+
+def _detect_lang(soup: BeautifulSoup) -> str:
+    html_tag = soup.find("html")
+    if html_tag and html_tag.get("lang"):
+        return html_tag["lang"].split("-")[0].lower()
+    return "unknown"
+
+
+# Label → field name mapping (English + Chinese keys)
+_LABEL_FIELD_MAP: dict[str, str] = {
+    # Organizer
+    "organizer": "organizer", "organiser": "organizer", "organized by": "organizer",
+    "organizing unit": "organizer", "host organization": "organizer",
+    "co-organizer": "organizer", "organizers": "organizer",
+    "主办单位": "organizer", "主办方": "organizer", "主办": "organizer",
+    "协办单位": "organizer",
+
+    # City / location
+    "host city": "city", "venue city": "city", "city": "city",
+    "host region": "city", "host area": "city", "event city": "city",
+    "host location": "city", "location": "city",
+    "举办地区": "city", "举办地": "city", "举办城市": "city", "城市": "city",
+
+    # Country
+    "country": "country", "nation": "country", "host country": "country",
+    "举办国家": "country", "国家": "country",
+
+    # Address
+    "address": "address", "venue address": "address", "hall address": "address",
+    "exhibition hall address": "address", "展馆地址": "address", "地址": "address",
+
+    # Category / Industry / Domain
+    "industry": "category", "sector": "category", "category": "category",
+    "type": "category", "fair type": "category", "domain": "category",
+    "所属行业": "category", "行业": "category", "类型": "category",
+
+    # Event location / hall
+    "exhibition hall": "event_location", "venue": "event_location", "hall": "event_location",
+    "exhibition venue": "event_location", "event venue": "event_location",
+    "举办展馆": "event_location", "展馆": "event_location", "展览馆": "event_location",
+    "举办地点": "event_location",
+
+    # Event date
+    "date": "event_date", "period": "event_date", "exhibition date": "event_date",
+    "event date": "event_date", "fair date": "event_date", "exhibition time": "event_date",
+    "show time": "event_date", "event time": "event_date",
+    "展会时间": "event_date", "展览时间": "event_date", "时间": "event_date",
+
+    # Scale / area
+    "scale": "scale", "area": "scale", "exhibition area": "scale",
+    "floor area": "scale", "gross area": "scale",
+    "展览面积": "scale", "面积": "scale", "展区面积": "scale",
+
+    # Exhibitor count
+    "exhibitors": "exhibitor_count", "number of exhibitors": "exhibitor_count",
+    "参展商": "exhibitor_count", "参展商数量": "exhibitor_count", "展商数量": "exhibitor_count",
+
+    # Visitor count
+    "visitors": "visitor_count", "attendance": "visitor_count",
+    "number of visitors": "visitor_count", "visitor count": "visitor_count",
+    "观众人数": "visitor_count", "观众数量": "visitor_count", "观众": "visitor_count",
+
+    # Website / contact
+    "website": "website", "web": "website", "official site": "website",
+    "official website": "website",
+    "展会网站": "website", "官网": "website", "网站": "website",
+    "phone": "phone", "telephone": "phone", "tel": "phone",
+    "电话": "phone", "联系电话": "phone",
+    "email": "email", "e-mail": "email",
+    "邮箱": "email", "电子邮件": "email",
+
+    # Booth / stand
+    "booth": "booth_number", "booth number": "booth_number", "booth no": "booth_number",
+    "stand": "booth_number", "stand number": "booth_number", "stand no": "booth_number",
+    "stand no.": "booth_number", "hall": "booth_number", "pavilion": "booth_number",
+    "展位": "booth_number", "展位号": "booth_number", "摊位": "booth_number",
+}
+
+
+def _extract_label_value_pairs(soup: BeautifulSoup, src_lang: str) -> dict:
+    """
+    Extract key-value structured info blocks (table rows, dl/dt/dd, label+value divs).
+    Translates labels to English before mapping to field names.
+    """
+    result: dict[str, str] = {}
+
+    def _map_pair(label_text: str, value_text: str) -> None:
+        if not label_text or not value_text:
+            return
+        if len(label_text) >= 60 or len(value_text.strip()) < 2:
+            return
+        # Try original label first (catches Chinese/Japanese/etc. keys directly)
+        label_orig = label_text.strip().rstrip(":：").strip()
+        field = _LABEL_FIELD_MAP.get(label_orig)
+        if not field:
+            # Fallback: translate label to English then look up
+            label_en = _translate(label_text, src_lang).lower().strip().rstrip(":：")
+            field = _LABEL_FIELD_MAP.get(label_en)
+        if field and not result.get(field):
+            translated_value = _translate(_clean_text(value_text, 300), src_lang)
+            result[field] = translated_value
+
+    # Pattern 1: <table> with 2-cell rows (label | value)
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        if len(cells) == 2:
+            _map_pair(cells[0].get_text(strip=True), cells[1].get_text(strip=True))
+
+    # Pattern 2: <dl><dt>label</dt><dd>value</dd></dl>
+    for dl in soup.find_all("dl"):
+        for dt, dd in zip(dl.find_all("dt"), dl.find_all("dd")):
+            _map_pair(dt.get_text(strip=True), dd.get_text(strip=True))
+
+    # Pattern 3: elements where class contains "item", "info", "detail", "row"
+    for container in soup.find_all(class_=re.compile(r'item|info.?row|detail|meta.?row|field', re.I)):
+        children = [c for c in container.children if hasattr(c, "get_text")]
+        if len(children) == 2:
+            _map_pair(children[0].get_text(strip=True), children[1].get_text(strip=True))
+
+    # Pattern 4: <p>Label:Value</p> — inline key:value in paragraph (e.g. WDS vendor profiles)
+    for p in soup.find_all("p"):
+        text = p.get_text(strip=True)
+        if ":" not in text or len(text) > 150:
+            continue
+        parts = text.split(":", 1)
+        label = parts[0].strip()
+        value = parts[1].strip()
+        if label and value and len(label) < 40:
+            _map_pair(label, value)
+
+    return result
+
 EMAIL_PATTERN = re.compile(
     r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'
 )
@@ -26,38 +177,101 @@ LINKEDIN_PATTERN = re.compile(
     r'https?://(?:www\.)?linkedin\.com/company/([A-Za-z0-9\-_]+)/?'
 )
 TWITTER_PATTERN = re.compile(
-    r'https?://(?:www\.)?(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)/?'
+    # Exclude share/intent/utility paths: intent, share, home, search, hashtag, i/, settings, etc.
+    r'https?://(?:www\.)?(?:twitter\.com|x\.com)/(?!intent|share|home|search|hashtag|i/|settings|notifications|messages|explore|login|signup|about)([A-Za-z0-9_]{1,50})(?:[/?]|$)'
 )
 COUNTRY_NAMES = {
+    # ── North America ─────────────────────────────────────────────────────────
     "united states": "United States", "usa": "United States", "u.s.a": "United States",
-    "united kingdom": "United Kingdom", "uk": "United Kingdom", "great britain": "United Kingdom",
+    "u.s.a.": "United States", "us": "United States",
+    "canada": "Canada", "mexico": "Mexico",
+
+    # ── South America ─────────────────────────────────────────────────────────
+    "brazil": "Brazil", "brasil": "Brazil",
+    "argentina": "Argentina", "colombia": "Colombia", "chile": "Chile",
+    "peru": "Peru", "venezuela": "Venezuela", "ecuador": "Ecuador",
+    "uruguay": "Uruguay", "paraguay": "Paraguay", "bolivia": "Bolivia",
+
+    # ── Western Europe ────────────────────────────────────────────────────────
+    "united kingdom": "United Kingdom", "uk": "United Kingdom",
+    "great britain": "United Kingdom", "england": "United Kingdom",
     "germany": "Germany", "deutschland": "Germany",
-    "france": "France", "israel": "Israel",
-    "australia": "Australia", "canada": "Canada",
-    "japan": "Japan", "china": "China",
-    "south korea": "South Korea", "korea": "South Korea",
-    "singapore": "Singapore", "india": "India",
-    "netherlands": "Netherlands", "sweden": "Sweden",
-    "norway": "Norway", "finland": "Finland",
-    "denmark": "Denmark", "switzerland": "Switzerland",
-    "austria": "Austria", "spain": "Spain", "italy": "Italy",
+    "france": "France", "spain": "Spain", "italy": "Italy",
+    "netherlands": "Netherlands", "holland": "Netherlands",
+    "belgium": "Belgium", "switzerland": "Switzerland",
+    "austria": "Austria", "sweden": "Sweden", "norway": "Norway",
+    "finland": "Finland", "denmark": "Denmark", "ireland": "Ireland",
+    "portugal": "Portugal", "luxembourg": "Luxembourg",
+    "iceland": "Iceland", "liechtenstein": "Liechtenstein",
+    "monaco": "Monaco", "andorra": "Andorra", "malta": "Malta",
+    "cyprus": "Cyprus",
+
+    # ── Eastern Europe ────────────────────────────────────────────────────────
     "poland": "Poland", "czech republic": "Czech Republic",
-    "russia": "Russia", "ukraine": "Ukraine",
-    "united arab emirates": "UAE", "uae": "UAE",
-    "saudi arabia": "Saudi Arabia", "brazil": "Brazil",
-    "new zealand": "New Zealand", "belgium": "Belgium",
-    "portugal": "Portugal", "turkey": "Turkey",
-    "malaysia": "Malaysia", "indonesia": "Indonesia",
-    "philippines": "Philippines", "thailand": "Thailand",
-    "taiwan": "Taiwan", "hong kong": "Hong Kong",
-    "south africa": "South Africa", "nigeria": "Nigeria",
-    "kenya": "Kenya", "egypt": "Egypt",
-    "mexico": "Mexico", "argentina": "Argentina",
-    "colombia": "Colombia", "chile": "Chile",
-    "ireland": "Ireland", "czech": "Czech Republic",
-    "estonia": "Estonia", "latvia": "Latvia", "lithuania": "Lithuania",
+    "czech": "Czech Republic", "czechia": "Czech Republic",
+    "slovakia": "Slovakia", "hungary": "Hungary",
     "romania": "Romania", "bulgaria": "Bulgaria",
-    "greece": "Greece", "hungary": "Hungary", "slovakia": "Slovakia",
+    "croatia": "Croatia", "slovenia": "Slovenia",
+    "serbia": "Serbia", "bosnia": "Bosnia and Herzegovina",
+    "bosnia and herzegovina": "Bosnia and Herzegovina",
+    "north macedonia": "North Macedonia", "albania": "Albania",
+    "kosovo": "Kosovo", "montenegro": "Montenegro",
+    "ukraine": "Ukraine", "belarus": "Belarus",
+    "moldova": "Moldova", "russia": "Russia",
+    "estonia": "Estonia", "latvia": "Latvia", "lithuania": "Lithuania",
+
+    # ── Middle East ───────────────────────────────────────────────────────────
+    "israel": "Israel", "turkey": "Turkey", "türkiye": "Turkey",
+    "united arab emirates": "UAE", "uae": "UAE",
+    "saudi arabia": "Saudi Arabia", "qatar": "Qatar",
+    "kuwait": "Kuwait", "bahrain": "Bahrain", "oman": "Oman",
+    "jordan": "Jordan", "iraq": "Iraq", "iran": "Iran",
+    "lebanon": "Lebanon", "syria": "Syria", "yemen": "Yemen",
+    "palestine": "Palestine",
+
+    # ── South Asia ────────────────────────────────────────────────────────────
+    "india": "India", "pakistan": "Pakistan",
+    "bangladesh": "Bangladesh", "sri lanka": "Sri Lanka",
+    "nepal": "Nepal", "bhutan": "Bhutan", "maldives": "Maldives",
+    "afghanistan": "Afghanistan",
+
+    # ── East Asia ─────────────────────────────────────────────────────────────
+    "china": "China", "prc": "China",
+    "japan": "Japan", "south korea": "South Korea",
+    "korea": "South Korea", "north korea": "North Korea",
+    "taiwan": "Taiwan", "hong kong": "Hong Kong", "macau": "Macau",
+    "mongolia": "Mongolia",
+
+    # ── Southeast Asia ────────────────────────────────────────────────────────
+    "singapore": "Singapore", "malaysia": "Malaysia",
+    "indonesia": "Indonesia", "thailand": "Thailand",
+    "philippines": "Philippines", "vietnam": "Vietnam",
+    "myanmar": "Myanmar", "burma": "Myanmar",
+    "cambodia": "Cambodia", "laos": "Laos", "brunei": "Brunei",
+    "timor-leste": "Timor-Leste", "east timor": "Timor-Leste",
+
+    # ── Central Asia ──────────────────────────────────────────────────────────
+    "kazakhstan": "Kazakhstan", "uzbekistan": "Uzbekistan",
+    "kyrgyzstan": "Kyrgyzstan", "tajikistan": "Tajikistan",
+    "turkmenistan": "Turkmenistan", "azerbaijan": "Azerbaijan",
+    "georgia": "Georgia", "armenia": "Armenia",
+
+    # ── Africa ────────────────────────────────────────────────────────────────
+    "south africa": "South Africa", "egypt": "Egypt",
+    "nigeria": "Nigeria", "kenya": "Kenya", "ethiopia": "Ethiopia",
+    "ghana": "Ghana", "tanzania": "Tanzania", "uganda": "Uganda",
+    "morocco": "Morocco", "algeria": "Algeria", "tunisia": "Tunisia",
+    "libya": "Libya", "sudan": "Sudan", "cameroon": "Cameroon",
+    "senegal": "Senegal", "zimbabwe": "Zimbabwe", "zambia": "Zambia",
+
+    # ── Oceania ───────────────────────────────────────────────────────────────
+    "australia": "Australia", "new zealand": "New Zealand",
+    "papua new guinea": "Papua New Guinea", "fiji": "Fiji",
+
+    # ── Multi-word aliases ────────────────────────────────────────────────────
+    "republic of korea": "South Korea", "rok": "South Korea",
+    "people's republic of china": "China",
+    "russian federation": "Russia",
 }
 
 CSS_SELECTORS_NAME = [
@@ -88,23 +302,27 @@ CSS_SELECTORS_PHONE = [
 
 CSS_SELECTORS_ADDRESS = [
     "[itemprop='address']", "[itemtype*='PostalAddress']",
-    "[class*='address']", "[class*='location']",
+    "[class*='address']",
+    # NOTE: [class*='location'] intentionally omitted — it too often matches
+    # the venue/event location section on expo pages, not the company address.
     "[data-field='address']", "[class*='contact-address']",
 ]
 
 CSS_SELECTORS_WEBSITE = [
     "[itemprop='url']", "a[class*='website']",
-    "a[class*='web-link']", "a[rel='noopener'][href^='http']",
+    "a[class*='web-link']", "a[class*='official']",
     "[data-field='website']", "[class*='official-site']",
 ]
 
 CSS_SELECTORS_DESCRIPTION = [
-    "[itemprop='description']", "meta[name='description']",
-    "meta[property='og:description']",
+    "[itemprop='description']",
     "[class*='company-desc']", "[class*='exhibitor-desc']",
     "[class*='about-us']", "[class*='overview']",
     "[class*='profile-desc']", "[class*='short-desc']",
+    "[class*='company-about']", "[class*='exhibitor-about']",
     "[data-field='description']",
+    # og:description only — meta[name='description'] is almost always site-level and handled below
+    "meta[property='og:description']",
 ]
 
 CSS_SELECTORS_CATEGORY = [
@@ -176,11 +394,17 @@ def _extract_phones_from_text(text: str) -> list[str]:
 
 
 def _detect_country_from_text(text: str) -> str:
+    """Return the country whose name appears earliest in the text.
+    Position-aware: avoids bias from dictionary insertion order."""
     text_lower = text.lower()
+    earliest_pos = len(text_lower) + 1
+    earliest_country = ""
     for key, value in COUNTRY_NAMES.items():
-        if re.search(r'\b' + re.escape(key) + r'\b', text_lower):
-            return value
-    return ""
+        m = re.search(r'\b' + re.escape(key) + r'\b', text_lower)
+        if m and m.start() < earliest_pos:
+            earliest_pos = m.start()
+            earliest_country = value
+    return earliest_country
 
 
 _WEBSITE_BLOCKLIST = {
@@ -190,6 +414,13 @@ _WEBSITE_BLOCKLIST = {
     "share.flipboard.com", "qualtrics.com", "typeform.com",
     "surveymonkey.com", "google.com", "apple.com", "microsoft.com",
     "amazon.com", "github.com", "wikipedia.org",
+    # Calendar / meeting / invite links — never a company website
+    "outlook.live.com", "outlook.com", "calendar.google.com",
+    "calendar.yahoo.com", "calendly.com", "zoom.us", "teams.microsoft.com",
+    "meet.google.com", "webex.com", "gotomeeting.com",
+    # China ICP / government registration — never a company website
+    "beian.gov.cn", "beian.miit.gov.cn", "mps.gov.cn",
+    "gongan.gov.cn", "icp.gov.cn",
 }
 
 
@@ -221,9 +452,6 @@ def _parse_schema_org_organization(data: dict) -> dict:
     type_val = data.get("@type", "")
     if isinstance(type_val, list):
         type_val = type_val[0] if type_val else ""
-    if not any(t in str(type_val) for t in ["Organization", "Corporation", "LocalBusiness", "Company"]):
-        if not any(t in str(type_val) for t in ["Person", "Event"]):
-            pass
 
     def get_field(d: dict, *keys: str) -> str:
         for k in keys:
@@ -265,33 +493,9 @@ def _count_populated(data: dict) -> int:
     return sum(1 for f in core_fields if data.get(f))
 
 
-class VendorRecord(BaseModel):
-    name: str = Field(default="", description="Company name")
-    website: Optional[str] = Field(default=None, description="Official website URL")
-    email: Optional[str] = Field(default=None, description="Contact email")
-    phone: Optional[str] = Field(default=None, description="Phone number")
-    address: Optional[str] = Field(default=None, description="Full address")
-    city: Optional[str] = Field(default=None, description="City")
-    country: Optional[str] = Field(default=None, description="Country")
-    category: Optional[str] = Field(default=None, description="Industry or product category")
-    description: Optional[str] = Field(default=None, description="Company description")
-    linkedin: Optional[str] = Field(default=None, description="LinkedIn company URL")
-    twitter: Optional[str] = Field(default=None, description="Twitter/X URL")
-    booth_number: Optional[str] = Field(default=None, description="Booth or stand number")
-    event_name: Optional[str] = Field(default=None, description="Event where exhibiting")
-    event_location: Optional[str] = Field(default=None, description="Event venue/city")
-    event_date: Optional[str] = Field(default=None, description="Event date")
-    source_url: str = Field(default="", description="URL where vendor was found")
-    extraction_method: str = Field(default="unknown", description="schema_org|rule_based|llm")
-    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+# ── Private helper implementations ───────────────────────────────────────────
 
-
-@tool
-def extract_schema_org(html: str, url: str) -> dict:
-    """
-    Extract vendor data using schema.org JSON-LD, microdata, and OpenGraph markup.
-    Zero LLM — pure structured data extraction. Returns VendorRecord dict or empty.
-    """
+def _extract_schema_org(html: str, url: str) -> dict:
     if not html:
         return {}
     try:
@@ -336,6 +540,17 @@ def extract_schema_org(html: str, url: str) -> dict:
         if v and not result.get(k):
             result[k] = v
 
+    # Translate text fields if page is non-English
+    if result:
+        try:
+            soup_tmp = BeautifulSoup(html[:2000], "lxml")
+        except Exception:
+            soup_tmp = BeautifulSoup(html[:2000], "html.parser")
+        src_lang = _detect_lang(soup_tmp)
+        for field in ("name", "description", "category", "address", "city", "country"):
+            if result.get(field):
+                result[field] = _translate(result[field], src_lang)
+
     if result:
         result["source_url"] = url
         result["extraction_method"] = "schema_org"
@@ -345,12 +560,7 @@ def extract_schema_org(html: str, url: str) -> dict:
     return result
 
 
-@tool
-def extract_rule_based(html: str, url: str) -> dict:
-    """
-    Extract vendor data using 100+ CSS selectors, regex, and heuristics.
-    Zero LLM — rule-based extraction. Returns VendorRecord dict.
-    """
+def _extract_rule_based(html: str, url: str) -> dict:
     if not html:
         return {}
 
@@ -359,20 +569,55 @@ def extract_rule_based(html: str, url: str) -> dict:
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
 
+    src_lang = _detect_lang(soup)
     parsed_url = urlparse(url)
     base_domain = parsed_url.netloc.lower()
-
     full_text = soup.get_text(separator=" ", strip=True)
-
     result = {}
 
     name = _extract_by_selectors(soup, CSS_SELECTORS_NAME)
-    if not name:
-        h1 = soup.find("h1")
-        if h1:
-            name = _clean_text(h1.get_text(strip=True))
-    if name and len(name) > 100:
+    # Guard: CSS selectors like [class*='detail'] h2 may match section headings
+    # (e.g. "<h2>About</h2>" inside a vendor profile page). Discard and use h-tag fallback.
+    _SECTION_HEADING_RE = re.compile(
+        r'^(about|overview|contact|news|home|services?|products?|solutions?|'
+        r'resources?|support|faq|privacy|terms|menu|search|'
+        r'quick\s+links?|our\s+\w+|all\s+\w+)$',
+        re.IGNORECASE,
+    )
+    if name and _SECTION_HEADING_RE.match(name.strip()):
         name = ""
+    if not name:
+        # Walk h1→h2→h3→h4; try main/article scope first then anywhere
+        main_scope = soup.find("main") or soup.find("article")
+        for tag in ("h1", "h2", "h3", "h4"):
+            h = (main_scope.find(tag) if main_scope else None) or soup.find(tag)
+            if h:
+                candidate = _clean_text(h.get_text(strip=True))
+                if candidate:
+                    name = candidate
+                    break
+    if not name:
+        # Page <title> ONLY when it contains a separator ("Company | Site Name")
+        title_tag = soup.find("title")
+        if title_tag:
+            title_text = _clean_text(title_tag.get_text(strip=True))
+            for sep in (" | ", " - ", " — ", " – "):
+                if sep in title_text:
+                    candidate = title_text.split(sep)[0].strip()
+                    if 2 <= len(candidate) <= 100:
+                        name = candidate
+                        break
+    if name:
+        name = _translate(name, src_lang)
+        # Strip trailing site name if still present (e.g. translated og:title)
+        for sep in (" | ", " - ", " — ", " – "):
+            if sep in name:
+                candidate = name.split(sep)[0].strip()
+                if 2 <= len(candidate) <= 100:
+                    name = candidate
+                    break
+        if len(name) > 100:
+            name = ""
     result["name"] = name
 
     email_from_selector = _extract_by_selectors(soup, CSS_SELECTORS_EMAIL)
@@ -391,48 +636,172 @@ def extract_rule_based(html: str, url: str) -> dict:
         if phones:
             result["phone"] = phones[0]
 
-    address = _extract_by_selectors(soup, CSS_SELECTORS_ADDRESS)
+    # Scope address to <main>/<article> — prevents matching footer-level venue
+    # address elements (e.g. class="saha-footer__address"). No full-page fallback:
+    # a blank address is better than the wrong venue address.
+    _main_for_addr = soup.find("main") or soup.find("article")
+    if _main_for_addr:
+        _addr_scope_soup = BeautifulSoup(str(_main_for_addr), "lxml")
+        address = _extract_by_selectors(_addr_scope_soup, CSS_SELECTORS_ADDRESS)
+    else:
+        address = _extract_by_selectors(soup, CSS_SELECTORS_ADDRESS)
+
+    # Fallback: find address as a <span> in an exhibitor contact card,
+    # near the mailto: link. Common pattern on expo sites:
+    #   div.exhibitor-info-card > div > div:nth-child(N) > span  (address plain text)
+    # We walk up from the mailto link to find a shared card container, then
+    # scan sibling <span> elements for address-like text.
+    if not address:
+        _mailto_el = soup.find("a", href=lambda h: h and h.startswith("mailto:"))
+        if _mailto_el:
+            _container = _mailto_el
+            for _ in range(6):  # walk up at most 6 levels
+                _container = getattr(_container, "parent", None)
+                if _container is None:
+                    break
+                # Only inspect containers that hold multiple child divs (contact card)
+                _child_divs = _container.find_all("div", recursive=False)
+                if len(_child_divs) < 2:
+                    continue
+                for _span in _container.find_all("span"):
+                    _stxt = _span.get_text(strip=True)
+                    # Address-like: has digits AND spaces, not an email/URL/domain
+                    _is_domain = re.search(r'\.\w{2,6}(/|$)', _stxt)
+                    if (15 < len(_stxt) < 250
+                            and re.search(r'\d', _stxt)
+                            and " " in _stxt              # addresses have spaces; URLs don't
+                            and "@" not in _stxt
+                            and "://" not in _stxt
+                            and not _is_domain            # not a bare domain like www.x.com
+                            and not re.match(r'^(?:Hall|Stand|Booth)\b', _stxt, re.I)):
+                        address = _stxt
+                        break
+                if address:
+                    break
+
     if address:
-        result["address"] = address
+        result["address"] = _translate(address, src_lang)
 
     website = _extract_by_selectors(soup, CSS_SELECTORS_WEBSITE)
+    # Discard if it's a calendar/tracking/redirect URL (>200 chars or known bad domain)
+    if website:
+        _w_dom = urlparse(website).netloc.lower().replace("www.", "")
+        if len(website) > 200 or any(bd in _w_dom for bd in _WEBSITE_BLOCKLIST):
+            website = ""
     if not website:
         website = _extract_website_from_links(soup, base_domain)
     if website and website.startswith("http") and base_domain not in website:
         result["website"] = website
 
+    # Strip leading section-heading words that get concatenated when a block extractor
+    # grabs e.g. <div class="about-us"><h2>About</h2><p>Company text...</p></div>
+    # via get_text(strip=True) → "About Company text..."
+    _STRIP_HEADING_PREFIX_RE = re.compile(
+        r'^(?:about|overview|profile|description|summary|introduction|'
+        r'info|information|history|vision|mission|company|who we are)\s*',
+        re.IGNORECASE,
+    )
+
     description = _extract_by_selectors(soup, CSS_SELECTORS_DESCRIPTION)
+    if description:
+        description = _STRIP_HEADING_PREFIX_RE.sub("", description).strip()
     if not description:
-        for p in soup.find_all("p")[:10]:
+        # Look for description as a sibling of the heading's parent container
+        # (common in Next.js vendor profiles: h4 is in a titles div, description is a sibling div)
+        _hx = soup.find(["h1", "h2", "h3", "h4"])
+        if _hx:
+            for _sib in _hx.parent.find_next_siblings():
+                _sib_text = _sib.get_text(separator=" ", strip=True)
+                if len(_sib_text) > 80 and _sib.name not in ("script", "style", "nav", "footer", "header"):
+                    description = _STRIP_HEADING_PREFIX_RE.sub("", _clean_text(_sib_text, 400)).strip()
+                    break
+    if not description:
+        # Fallback: first long <p> in main content
+        _scope = soup.find("main") or soup.find("article") or soup
+        for p in _scope.find_all("p"):
             p_text = p.get_text(strip=True)
             if len(p_text) > 80:
                 description = _clean_text(p_text, 400)
                 break
+    if not description:
+        # Last resort: meta[name='description'] — often site-level, only use if >30 chars
+        _meta_desc = soup.find("meta", {"name": "description"})
+        if _meta_desc:
+            _meta_val = (_meta_desc.get("content") or "").strip()
+            if len(_meta_val) > 30:
+                description = _meta_val
     if description:
-        result["description"] = description
+        result["description"] = _translate(description, src_lang)
 
     category = _extract_by_selectors(soup, CSS_SELECTORS_CATEGORY)
     if category:
-        result["category"] = category
+        # Reject if it looks like an event/expo title (too long, or contains exhibition keywords)
+        _is_event_name = re.search(
+            r'\b(exhibition|expo|fair|congress|summit|conference|symposium|forum|trade\s+show)\b',
+            category, re.IGNORECASE
+        )
+        if _is_event_name or len(category) > 60:
+            category = ""
+    if category:
+        result["category"] = _translate(category, src_lang)
 
     country = _extract_by_selectors(soup, CSS_SELECTORS_COUNTRY)
+    if country and len(country) > 50:  # nav menu / long list, not a real country value
+        country = ""
     if not country:
-        country = _detect_country_from_text(full_text[:2000])
+        # Only run text-based country detection when name was found via structured selector
+        # (not h-tag fallback) to avoid false positives on listing pages with many country names
+        _has_structured_name = bool(_extract_by_selectors(soup, CSS_SELECTORS_NAME))
+        if _has_structured_name or result.get("address") or result.get("booth_number"):
+            text_for_detection = full_text[:2000]
+            if src_lang not in ("en", "id", "unknown"):
+                text_for_detection = _translate(text_for_detection[:500], src_lang) + " " + text_for_detection
+            country = _detect_country_from_text(text_for_detection)
     if country:
         result["country"] = country
 
     booth = _extract_by_selectors(soup, CSS_SELECTORS_BOOTH)
-    if booth:
-        result["booth_number"] = booth
+    # Reject if booth text is too long — likely a marketing block, not a booth number
+    if booth and len(booth) <= 60:
+        result["booth_number"] = _translate(booth, src_lang)
 
-    linkedin_match = LINKEDIN_PATTERN.search(html)
+    # Social links — scope to main content to avoid grabbing site-wide footer links
+    _main = soup.find("main") or soup.find("article") or soup.find(id=re.compile(r"^(content|main)$", re.I))
+    _social_html = str(_main) if _main else html
+    linkedin_match = LINKEDIN_PATTERN.search(_social_html)
     if linkedin_match:
         result["linkedin"] = linkedin_match.group(0)
 
-    twitter_match = TWITTER_PATTERN.search(html)
+    twitter_match = TWITTER_PATTERN.search(_social_html)
     if twitter_match:
         result["twitter"] = twitter_match.group(0)
 
+    # Extract structured label-value pairs (works well on directory/expo sites)
+    label_pairs = _extract_label_value_pairs(soup, src_lang)
+    for field, value in label_pairs.items():
+        if value and not result.get(field):
+            # For count fields, keep only the number
+            if field in ("exhibitor_count", "visitor_count", "scale"):
+                num_match = re.search(r'[\d,\.]+', value)
+                if num_match:
+                    unit = ""
+                    if "㎡" in value or "m²" in value.lower() or "sqm" in value.lower():
+                        unit = "㎡"
+                    value = num_match.group(0).replace(",", "") + unit
+            result[field] = value
+
+    # Booth / hall / stand — regex fallback on full text (handles "Hall: 2 | Stand: 2C-05")
+    if not result.get("booth_number"):
+        _booth_re = re.search(
+            r'(?:Hall\s*[:\-]\s*\w[\w\-]*(?:\s*[|,]\s*Stand\s*[:\-]\s*[\w\-]+)?'
+            r'|Stand\s*[:\-]\s*[\w\-]+'
+            r'|Booth\s*[:\-]\s*[\w\-]+)',
+            full_text, re.IGNORECASE
+        )
+        if _booth_re:
+            result["booth_number"] = _booth_re.group(0).strip()[:60]
+
+    # City from address fallback
     address_val = result.get("address", "")
     if address_val and not result.get("city"):
         parts = [p.strip() for p in address_val.split(",")]
@@ -449,12 +818,46 @@ def extract_rule_based(html: str, url: str) -> dict:
     return result
 
 
-@tool
-def extract_with_llm(html: str, url: str, context: str = "") -> dict:
+def _extract_with_jina_llm(url: str, context: str = "") -> dict:
     """
-    FALLBACK ONLY: Extract vendor data using GPT-4o when schema_org and rule_based fail.
-    Sends max 1500 chars of cleaned text to minimize token usage.
-    Only called when other methods return < 3 fields.
+    Fetch clean Markdown from Jina AI Reader (free, no key required), then pass to LLM.
+    Falls back to empty dict if Jina fetch fails or LLM is disabled.
+    """
+    import asyncio
+    from backend.tools.fetch_tools import _fetch_jina_markdown
+
+    settings = get_settings()
+
+    # Run the async Jina fetch in whatever context we're in
+    try:
+        try:
+            loop = asyncio.get_event_loop()
+            is_running = loop.is_running()
+        except RuntimeError:
+            is_running = False
+
+        if is_running:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                markdown = pool.submit(asyncio.run, _fetch_jina_markdown(url)).result(timeout=90)
+        else:
+            markdown = asyncio.run(_fetch_jina_markdown(url))
+    except Exception as e:
+        logger.warning(f"[JINA-LLM] Jina fetch failed for {url}: {e}")
+        return {}
+
+    if not markdown or len(markdown) < 100:
+        logger.debug(f"[JINA-LLM] Markdown too short for {url}")
+        return {}
+
+    logger.info(f"[JINA-LLM] Got {len(markdown):,} chars of markdown from {url}")
+    return _extract_with_llm_text(markdown, url, context, source_label="jina")
+
+
+def _extract_with_llm_text(text: str, url: str, context: str = "", source_label: str = "llm") -> dict:
+    """
+    Run LLM vendor extraction on arbitrary text (markdown or plain text).
+    Trims to token budget, returns vendor dict or empty.
     """
     settings = get_settings()
     if not settings.effective_llm_enabled:
@@ -462,26 +865,17 @@ def extract_with_llm(html: str, url: str, context: str = "") -> dict:
         return {}
 
     try:
-        import html2text as h2t
         import tiktoken
-        import json
-        import re
         from openai import OpenAI
 
-        converter = h2t.HTML2Text()
-        converter.ignore_links = True
-        converter.ignore_images = True
-        converter.body_width = 0
-        text = converter.handle(html)
-
         lines = [ln.strip() for ln in text.split("\n") if ln.strip() and len(ln.strip()) > 3]
-        text = "\n".join(lines)
-        text = text[:settings.llm_max_input_chars]
+        cleaned = "\n".join(lines)
+        cleaned = cleaned[:settings.llm_max_input_chars]
 
         enc = tiktoken.encoding_for_model("gpt-4o-mini")
-        tokens = len(enc.encode(text))
+        tokens = len(enc.encode(cleaned))
         if tokens > 400:
-            text = enc.decode(enc.encode(text)[:400])
+            cleaned = enc.decode(enc.encode(cleaned)[:400])
 
         client = OpenAI(api_key=settings.openai_api_key)
 
@@ -492,7 +886,7 @@ def extract_with_llm(html: str, url: str, context: str = "") -> dict:
             "Omit keys you are not confident about. No explanation, just JSON."
         )
         context_suffix = f" (source: {context[:100]})" if context else ""
-        user_prompt = f"URL: {url}{context_suffix}\n\n{text}"
+        user_prompt = f"URL: {url}{context_suffix}\n\n{cleaned}"
 
         create_kwargs: dict = {
             "model": settings.openai_model,
@@ -510,7 +904,7 @@ def extract_with_llm(html: str, url: str, context: str = "") -> dict:
         content = (response.choices[0].message.content or "").strip()
 
         if not content:
-            logger.warning(f"[LLM] Empty response for {url}")
+            logger.warning(f"[{source_label.upper()}] Empty response for {url}")
             return {}
 
         try:
@@ -518,7 +912,7 @@ def extract_with_llm(html: str, url: str, context: str = "") -> dict:
         except json.JSONDecodeError:
             m = re.search(r"\{[^{}]*\}", content, re.DOTALL)
             if not m:
-                logger.warning(f"[LLM] No JSON found in response for {url}")
+                logger.warning(f"[{source_label.upper()}] No JSON found in response for {url}")
                 return {}
             raw = json.loads(m.group(0))
 
@@ -527,25 +921,35 @@ def extract_with_llm(html: str, url: str, context: str = "") -> dict:
 
         if result:
             result["source_url"] = url
-            result["extraction_method"] = "llm"
+            result["extraction_method"] = source_label
             populated = _count_populated(result)
             result["confidence_score"] = min(populated / 5.0, 1.0)
-            logger.info(f"[LLM] Extracted {populated} fields from {url} (~{tokens} tokens in)")
+            logger.info(f"[{source_label.upper()}] Extracted {populated} fields from {url} (~{tokens} tokens in)")
 
         return result
 
     except Exception as e:
-        logger.warning(f"[LLM] Extraction failed for {url}: {type(e).__name__}: {e}")
+        logger.warning(f"[{source_label.upper()}] Extraction failed for {url}: {type(e).__name__}: {e}")
         return {}
 
 
-@tool
-def merge_vendor_data(sources: list[dict]) -> dict:
-    """
-    Merge vendor data from multiple extraction sources.
-    Priority: schema_org > rule_based > llm > enrichment.
-    Returns the best combined record.
-    """
+def _extract_with_llm(html: str, url: str, context: str = "") -> dict:
+    """Convert HTML → plain text, then run LLM vendor extraction."""
+    try:
+        import html2text as h2t
+        converter = h2t.HTML2Text()
+        converter.ignore_links = True
+        converter.ignore_images = True
+        converter.body_width = 0
+        text = converter.handle(html)
+    except Exception as e:
+        logger.warning(f"[LLM] html2text conversion failed for {url}: {e}")
+        text = html
+
+    return _extract_with_llm_text(text, url, context, source_label="llm")
+
+
+def _merge_vendor_data(sources: list[dict]) -> dict:
     if not sources:
         return {}
     if len(sources) == 1:
@@ -587,12 +991,7 @@ def merge_vendor_data(sources: list[dict]) -> dict:
     return merged
 
 
-@tool
-def validate_vendor(vendor: dict) -> dict:
-    """
-    Validate and clean a vendor record. Normalizes fields, removes invalid data,
-    computes final confidence score. Returns cleaned vendor dict.
-    """
+def _validate_vendor(vendor: dict) -> dict:
     if not vendor:
         return {}
 
@@ -604,7 +1003,16 @@ def validate_vendor(vendor: dict) -> dict:
         r'sign in|log in|register|subscribe|newsletter|follow us|share|'
         r'twitter|facebook|linkedin|instagram|youtube|flickr|'
         r'menu|navigation|header|footer|sidebar|search|'
-        r'copyright|all rights reserved|\d{4})$',
+        r'copyright|all rights reserved|\d{4}|'
+        # Listing/directory page titles — not real company names
+        r'exhibitors?(\s+(list|directory|search|results?|profile))?|'
+        r'vendors?(\s+(list|directory|search|results?))?|'
+        r'companies|company\s+(list|directory)|'
+        r'participants?(\s+list)?|sponsors?(\s+list)?|'
+        r'our\s+(exhibitors?|vendors?|sponsors?|partners?)|'
+        r'all\s+(exhibitors?|companies|vendors?)|'
+        r'quick\s+links?|'
+        r'exhibitor\s+list|vendor\s+list|company\s+list)$',
         re.IGNORECASE,
     )
 
@@ -642,6 +1050,9 @@ def validate_vendor(vendor: dict) -> dict:
     website = cleaned.get("website", "")
     if website:
         if not website.startswith(("http://", "https://")):
+            cleaned.pop("website", None)
+        elif len(website) > 200:
+            # Calendar links, tracking URLs, redirect chains — not real vendor websites
             cleaned.pop("website", None)
         else:
             w_domain = urlparse(website).netloc.lower().replace("www.", "")
@@ -688,49 +1099,668 @@ def validate_vendor(vendor: dict) -> dict:
     return cleaned
 
 
+# ── Public @tool wrappers ─────────────────────────────────────────────────────
+
+class VendorRecord(BaseModel):
+    name: str = Field(default="", description="Company name")
+    website: Optional[str] = Field(default=None, description="Official website URL")
+    email: Optional[str] = Field(default=None, description="Contact email")
+    phone: Optional[str] = Field(default=None, description="Phone number")
+    address: Optional[str] = Field(default=None, description="Full address")
+    city: Optional[str] = Field(default=None, description="City")
+    country: Optional[str] = Field(default=None, description="Country")
+    category: Optional[str] = Field(default=None, description="Industry or product category")
+    description: Optional[str] = Field(default=None, description="Company description")
+    linkedin: Optional[str] = Field(default=None, description="LinkedIn company URL")
+    twitter: Optional[str] = Field(default=None, description="Twitter/X URL")
+    booth_number: Optional[str] = Field(default=None, description="Booth or stand number")
+    event_name: Optional[str] = Field(default=None, description="Event where exhibiting")
+    event_location: Optional[str] = Field(default=None, description="Event venue/city")
+    event_date: Optional[str] = Field(default=None, description="Event date")
+    source_url: str = Field(default="", description="URL where vendor was found")
+    extraction_method: str = Field(default="unknown", description="schema_org|rule_based|llm")
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
 @tool
-def run_extraction_pipeline(html: str, url: str, event_context: dict = None) -> dict:
+def extract_schema_org(html: str, url: str) -> dict:
     """
-    Run the full extraction pipeline: schema_org → rule_based → llm (fallback).
-    Returns the best result with extraction_method indicating which succeeded.
+    Extract vendor data using schema.org JSON-LD, microdata, and OpenGraph markup.
+    Zero LLM — pure structured data extraction. Returns VendorRecord dict or empty.
     """
+    return _extract_schema_org(html, url)
+
+
+@tool
+def extract_rule_based(html: str, url: str) -> dict:
+    """
+    Extract vendor data using 100+ CSS selectors, regex, and heuristics.
+    Zero LLM — rule-based extraction. Returns VendorRecord dict.
+    """
+    return _extract_rule_based(html, url)
+
+
+@tool
+def extract_with_llm(html: str, url: str, context: str = "") -> dict:
+    """
+    FALLBACK ONLY: Extract vendor data using GPT when schema_org and rule_based fail.
+    Sends max 400 tokens of cleaned text to minimize token usage.
+    """
+    return _extract_with_llm(html, url, context)
+
+
+@tool
+def merge_vendor_data(sources: list[dict]) -> dict:
+    """
+    Merge vendor data from multiple extraction sources.
+    Priority: schema_org > rule_based > llm > enrichment.
+    Returns the best combined record.
+    """
+    return _merge_vendor_data(sources)
+
+
+@tool
+def validate_vendor(vendor: dict) -> dict:
+    """
+    Validate and clean a vendor record. Normalizes fields, removes invalid data,
+    computes final confidence score. Returns cleaned vendor dict.
+    """
+    return _validate_vendor(vendor)
+
+
+@tool
+def discover_vendor_urls(url: str, max_urls: int = 100) -> list[str]:
+    """
+    Discover individual vendor/exhibitor profile URLs from a listing or expo page.
+    The page must have been fetched first with fetch_page or fetch_pages_batch.
+
+    Strategy:
+    - Finds all same-domain internal links
+    - Scores each URL by how likely it is a vendor profile (keyword matching + pattern repetition)
+    - Returns up to max_urls ranked URLs, excluding the source URL itself
+
+    Returns: list of candidate vendor profile URLs (strings)
+    """
+    from collections import defaultdict
+    from urllib.parse import urlparse, urljoin
+    from backend.tools.fetch_tools import get_cached_html
+
+    html = get_cached_html(url)
+    if not html:
+        logger.warning(f"[DISCOVER] No cached HTML for {url} — fetch it first")
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    base_parsed = urlparse(url)
+    base_domain = base_parsed.netloc
+    source_path = url.rstrip("/")
+
+    # Keywords that strongly suggest a vendor/exhibitor profile URL path
+    VENDOR_PATH_KEYWORDS = [
+        "exhibitor", "vendor", "company", "booth", "brand", "participant",
+        "sponsor", "supplier", "partner", "profile", "member", "katilimci",
+        "firma", "expositor", "empresa", "exposant", "aussteller", "unternehmen",
+        "detail", "listing", "directory",
+    ]
+
+    # Keywords that suggest navigation / utility pages (not vendor profiles)
+    NAV_PATH_KEYWORDS = [
+        "login", "register", "signup", "sign-up", "contact", "about", "faq",
+        "privacy", "terms", "cookie", "sitemap", "search", "tag", "category",
+        "news", "blog", "press", "media", "career", "jobs", "help",
+    ]
+
+    def make_absolute(href: str) -> str | None:
+        href = href.strip()
+        if not href or href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:") or href.startswith("javascript:"):
+            return None
+        if href.startswith("//"):
+            return "https:" + href
+        if href.startswith("/"):
+            return f"{base_parsed.scheme}://{base_domain}{href}"
+        if href.startswith("http"):
+            return href
+        return urljoin(url, href)
+
+    # Collect all internal links
+    candidate_scores: dict[str, int] = {}
+    pattern_groups: dict[str, list[str]] = defaultdict(list)
+
+    for a in soup.find_all("a", href=True):
+        href = make_absolute(a.get("href", ""))
+        if not href:
+            continue
+        parsed = urlparse(href)
+        # Must be same domain
+        if base_domain not in parsed.netloc:
+            continue
+        # Skip source URL itself
+        if href.rstrip("/") == source_path:
+            continue
+        # Skip URLs with query strings that look like search/filter
+        if len(parsed.query) > 30:
+            continue
+
+        path_lower = parsed.path.lower()
+
+        # Skip obvious nav/utility pages
+        if any(kw in path_lower for kw in NAV_PATH_KEYWORDS):
+            continue
+
+        # Score based on path keyword match
+        score = 0
+        for kw in VENDOR_PATH_KEYWORDS:
+            if kw in path_lower:
+                score += 3
+
+        # Detect repeated patterns (listing grid) — group by first 2 path segments
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2:
+            pattern_key = "/" + "/".join(parts[:2])
+        elif len(parts) == 1:
+            pattern_key = "/" + parts[0]
+        else:
+            pattern_key = "/"
+
+        pattern_groups[pattern_key].append(href)
+
+        # Start accumulating with at least 0 score for valid internal links
+        if href not in candidate_scores:
+            candidate_scores[href] = score
+
+    # Boost URLs that share a pattern with many others (likely a listing grid)
+    for pattern, hrefs in pattern_groups.items():
+        if len(hrefs) >= 3:  # ≥3 URLs with same path prefix = likely individual profiles
+            for href in hrefs:
+                if href in candidate_scores:
+                    candidate_scores[href] += 5  # strong listing signal
+
+    # Filter: only keep URLs with score > 0 (some signal)
+    filtered = [(href, score) for href, score in candidate_scores.items() if score > 0]
+    filtered.sort(key=lambda x: x[1], reverse=True)
+
+    result = [href for href, _ in filtered[:max_urls]]
+    logger.info(f"[DISCOVER] {url} → {len(result)} candidate vendor URLs (from {len(candidate_scores)} total links)")
+    return result
+
+
+def _parse_exhibitor_pdf_table(markdown: str, source_url: str) -> list[dict]:
+    """
+    Parse markdown table format returned by Firecrawl for structured PDFs.
+
+    Handles formats like:
+      | NO. | COMPANY NAME | COUNTRY | BOOTH NO. |   (ADAS-style)
+      |  | Exhibitor | Country | Stand Number | Pavillion |  (DSA-style, empty NO col)
+
+    Column positions are auto-detected from the header row using the FULL cell
+    list (including empty cells), so an empty number column doesn't shift indices.
+    Headers repeat after page breaks ('* * *') and are re-detected each time.
+    """
+    vendors: list[dict] = []
+    seen_names: set[str] = set()
+
+    # Column indices into the inner cell list (split('|')[1:-1])
+    col_name = col_country = col_booth = -1
+    col_name_found = False
+
+    def _inner_cells(line: str) -> list[str]:
+        """Split '| a | b | c |' → ['a', 'b', 'c'] (inner cells, stripped)."""
+        parts = line.split('|')
+        return [p.strip() for p in parts[1:-1]]  # skip leading/trailing ''
+
+    def _get(cells: list[str], idx: int) -> str:
+        return cells[idx].strip() if 0 <= idx < len(cells) else ""
+
+    def _resolve_country(raw: str) -> str:
+        """Normalise 'UK / SINGAPORE' → 'United Kingdom', 'TURKEY' → 'Turkey' etc."""
+        if not raw:
+            return ""
+        for part in re.split(r'[/,&]', raw):
+            candidate = part.strip().lower()
+            direct = COUNTRY_NAMES.get(candidate)
+            if direct:
+                return direct
+            # Word-boundary search
+            match = next((v for k, v in COUNTRY_NAMES.items()
+                          if re.search(r'\b' + re.escape(k) + r'\b', candidate)), "")
+            if match:
+                return match
+        return raw.split('/')[0].strip()  # fallback: first segment as-is
+
+    HEADER_NAME_VALS = {'COMPANY NAME', 'COMPANY', 'EXHIBITOR', 'EXHIBITOR NAME',
+                        'NAME', 'FIRM', 'PARTICIPANT', 'EXHIBITOR/PARTICIPANT'}
+    HEADER_NO_VALS   = {'NO.', 'NO', 'SR.NO.', 'S.NO', '#', 'NUMBER', 'NUM', 'SN'}
+    HEADER_CTY_VALS  = {'COUNTRY', 'NATION', 'NATIONALITY'}
+    HEADER_BOOTH_KWS = ('BOOTH', 'STAND', 'HALL', 'PAVILION', 'STALL', 'STAND NUMBER')
+
+    for line in markdown.split('\n'):
+        stripped = line.strip()
+        if not stripped.startswith('|'):
+            continue
+
+        inner = _inner_cells(stripped)  # preserves empty cells → correct indices
+
+        # ── separator row ─────────────────────────────────────────────────────
+        if all(not c or re.match(r'^-+$', c) for c in inner):
+            continue
+
+        upper_inner = [c.upper() for c in inner]
+
+        # ── header detection ──────────────────────────────────────────────────
+        has_name_col = any(c in HEADER_NAME_VALS for c in upper_inner)
+        if has_name_col:
+            # Re-detect column positions each time a header appears (page repeats)
+            col_name = col_country = col_booth = -1
+            for j, cu in enumerate(upper_inner):
+                if cu in HEADER_NAME_VALS:
+                    col_name = j
+                elif cu in HEADER_CTY_VALS:
+                    col_country = j
+                elif any(kw in cu for kw in HEADER_BOOTH_KWS):
+                    col_booth = j
+            col_name_found = col_name >= 0
+            continue
+
+        if not col_name_found:
+            continue
+
+        # ── data row ──────────────────────────────────────────────────────────
+        name = _get(inner, col_name)
+        if not name or len(name) < 2 or re.match(r'^-+$', name):
+            continue
+        # Reject re-rendered header labels
+        if name.upper() in HEADER_NAME_VALS | HEADER_NO_VALS:
+            continue
+
+        name_key = name.lower()
+        if name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+
+        country = _resolve_country(_get(inner, col_country))
+        booth   = _get(inner, col_booth)[:60]
+
+        vendor: dict = {"name": name, "source_url": source_url, "extraction_method": "pdf_table"}
+        if country:
+            vendor["country"] = country
+        if booth:
+            vendor["booth_number"] = booth
+
+        populated = sum(1 for k in ("name", "country", "booth_number") if vendor.get(k))
+        vendor["confidence_score"] = min(populated / 3.0, 1.0) * 0.85
+        vendors.append(vendor)
+
+    logger.info(f"[PDF-TABLE] Parsed {len(vendors)} vendors from markdown table")
+    return vendors
+
+
+def _parse_exhibitor_pdf_markdown(markdown: str, source_url: str) -> list[dict]:
+    """
+    Parse Jina-rendered PDF exhibitor list markdown into a list of vendor dicts.
+
+    Jina renders the PDF as double-newline-separated blocks:
+        '1 SADAS  Afghanistan \\n\\n'
+        '2 AMDA Foundation Limited  Australia  4500A  Team Defence \\n\\n'
+        'Australia (Australia) \\n\\n'
+        '3 ARB 4x4 ACCESSORIES  Australia \\n\\n'
+
+    Strategy:
+    1. Split content by \\n\\n → get paragraph blocks
+    2. A block starting with a number = new exhibitor entry
+    3. Non-numbered continuation blocks belong to the previous entry
+    4. Within each entry, split by 2+ spaces → columns: name, country, booth, pavilion
+    """
+    # Extract markdown content section
+    md_start = markdown.find("Markdown Content:")
+    content   = markdown[md_start + len("Markdown Content:"):] if md_start >= 0 else markdown
+
+    # Split into paragraph blocks (Jina uses \n\n as block separator)
+    blocks = [b.strip() for b in re.split(r'\n\n+', content)]
+    blocks = [b for b in blocks if b]
+
+    ENTRY_START = re.compile(r'^(\d+)\s{1,2}(.+)', re.DOTALL)
+    SKIP_RE     = re.compile(
+        r'EXHIBITOR LIST|PARTICIPATING COMPANIES|Updated as of|'
+        r'Country\s*/\s*Region|Exhibitor\s+Country|^Page \d+$|'
+        r'DEFENCE SERVICE|NATIONAL SECURITY|aca\s+Pav',
+        re.IGNORECASE,
+    )
+
+    def _parse_entry(text: str) -> dict | None:
+        """Parse combined entry text: '{name}  {country}  {booth}  {pavilion}'"""
+        # Collapse inner newlines to single space first
+        text = re.sub(r'\s*\n\s*', ' ', text).strip()
+        # Split on 2+ spaces → columns
+        parts = [p.strip() for p in re.split(r'\s{2,}', text) if p.strip()]
+        if not parts:
+            return None
+
+        name = parts[0]
+        # Reject very short/long names or pure digits
+        if len(name) < 2 or len(name) > 200 or re.match(r'^\d+$', name):
+            return None
+        # Reject header/footer lines that slipped through
+        if SKIP_RE.search(name):
+            return None
+
+        country = ""
+        booth   = ""
+
+        if len(parts) >= 2:
+            raw = re.sub(r'\s*\([^)]+\)\s*$', '', parts[1]).strip()
+            raw_lower = raw.lower()
+            # Check if it's a known country
+            is_known_country = (
+                raw_lower in COUNTRY_NAMES or
+                any(re.search(r'\b' + re.escape(k) + r'\b', raw_lower) for k in COUNTRY_NAMES)
+            )
+            # Check if it looks like a booth code (e.g. "4500A", "H1-23")
+            is_booth_code = bool(re.match(r'^[A-Z0-9][\w,\-\s]{0,15}$', raw) and len(raw) <= 12 and not re.search(r'[a-z]', raw))
+
+            if is_booth_code:
+                booth = raw
+            elif is_known_country:
+                country = raw
+            else:
+                # Unrecognized — likely continuation of company name (wrapped line)
+                name = (name + " " + raw).strip()
+
+        if len(parts) >= 3:
+            candidate = parts[2].strip()
+            cand_lower = candidate.lower()
+            cand_is_country = (
+                cand_lower in COUNTRY_NAMES or
+                any(re.search(r'\b' + re.escape(k) + r'\b', cand_lower) for k in COUNTRY_NAMES)
+            )
+            if cand_is_country and not country:
+                country = candidate   # e.g. "Australia" that landed in col 3 due to wrapping
+            elif len(candidate) <= 25 and not booth:
+                booth = candidate
+
+        # Last resort: infer country from company name (e.g. "Australian..." → Australia)
+        if not country:
+            country = _detect_country_from_text(name)
+
+        vendor: dict = {
+            "name":       name,
+            "source_url": source_url,
+            "extraction_method": "pdf_rule_based",
+        }
+        if country:
+            vendor["country"] = country
+        if booth:
+            vendor["booth_number"] = booth[:60]
+
+        populated = sum(1 for k in ["name", "country", "booth_number"] if vendor.get(k))
+        vendor["confidence_score"] = min(populated / 3.0, 1.0) * 0.7
+
+        return vendor
+
+    # ── Group blocks into entries ─────────────────────────────────────────────
+    entries: list[str] = []
+    current: str | None = None
+
+    for block in blocks:
+        # Collapse internal newlines within a block to single space
+        block_flat = re.sub(r'\s*\n\s*', ' ', block).strip()
+        if not block_flat:
+            continue
+        if SKIP_RE.search(block_flat):
+            continue
+
+        m = ENTRY_START.match(block_flat)
+        if m:
+            if current is not None:
+                entries.append(current)
+            current = m.group(2).strip()
+        elif current is not None:
+            # Continuation block (pavilion/country name on next line)
+            # Append with double space so column-split still works
+            current += "  " + block_flat
+
+    if current is not None:
+        entries.append(current)
+
+    vendors = [v for v in (_parse_entry(e) for e in entries) if v]
+    logger.info(f"[PDF] Parsed {len(vendors)} vendor entries from PDF markdown")
+    return vendors
+
+
+def _run_coro_sync(coro) -> object:
+    """Run an async coroutine from sync code, handling already-running event loops."""
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        is_running = loop.is_running()
+    except RuntimeError:
+        is_running = False
+
+    if is_running:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(asyncio.run, coro).result(timeout=180)
+    else:
+        return asyncio.run(coro)
+
+
+def _extract_vendors_from_pdf(url: str) -> list[dict]:
+    """
+    Fetch a PDF and extract all vendor/exhibitor records.
+
+    Parser priority:
+      1. Firecrawl /v2/parse (Rust engine, 5x faster) — if FIRECRAWL_API_KEY is set
+      2. Jina AI Reader (free, no key needed) — fallback
+      3. LLM on first 3000 chars — last resort if rule-based yields nothing
+
+    All valid vendors are automatically registered in the global registry.
+    """
+    from backend.tools.fetch_tools import _fetch_firecrawl_parse, _fetch_jina_markdown
+
+    settings = get_settings()
+    markdown = ""
+
+    # ── 1. Firecrawl /parse (preferred when key is set) ──────────────────────
+    if settings.has_firecrawl_key:
+        try:
+            markdown = _run_coro_sync(_fetch_firecrawl_parse(url))
+            if markdown:
+                logger.info(f"[PDF] Firecrawl returned {len(markdown):,} chars for {url}")
+        except Exception as e:
+            logger.warning(f"[PDF] Firecrawl failed for {url}: {e}")
+            markdown = ""
+
+    # ── 2. Jina fallback ──────────────────────────────────────────────────────
+    if not markdown:
+        try:
+            markdown = _run_coro_sync(_fetch_jina_markdown(url))
+            if markdown:
+                logger.info(f"[PDF] Jina returned {len(markdown):,} chars for {url}")
+        except Exception as e:
+            logger.warning(f"[PDF] Jina fetch failed for {url}: {e}")
+            markdown = ""
+
+    if not markdown or len(markdown) < 50:
+        logger.warning(f"[PDF] No content from any parser for {url}")
+        return []
+
+    # ── Parser 1: Markdown table (Firecrawl output) ───────────────────────────
+    table_vendors = _parse_exhibitor_pdf_table(markdown, url)
+    if table_vendors and len(table_vendors) >= 3:
+        validated = [v for v in (_validate_vendor(v) for v in table_vendors) if v]
+        logger.info(f"[PDF] Table parser: {len(validated)} valid vendors")
+        from backend.tools.vendor_registry import register_vendors
+        total = register_vendors(validated)
+        logger.info(f"[PDF] Registry now has {total} vendors total")
+        return validated
+
+    # ── Parser 2: Numbered text (Jina / DSA-style) ───────────────────────────
+    numbered_vendors = _parse_exhibitor_pdf_markdown(markdown, url)
+    if numbered_vendors and len(numbered_vendors) >= 3:
+        validated = [v for v in (_validate_vendor(v) for v in numbered_vendors) if v]
+        logger.info(f"[PDF] Numbered parser: {len(validated)} valid vendors")
+        from backend.tools.vendor_registry import register_vendors
+        total = register_vendors(validated)
+        logger.info(f"[PDF] Registry now has {total} vendors total")
+        return validated
+
+    # ── Both parsers found few/zero — merge and try ───────────────────────────
+    merged = table_vendors + numbered_vendors
+    if len(merged) >= 1:
+        validated = [v for v in (_validate_vendor(v) for v in merged) if v]
+        if validated:
+            from backend.tools.vendor_registry import register_vendors
+            register_vendors(validated)
+            return validated
+
+    # ── Parser 3: LLM fallback on first 6000 chars ───────────────────────────
+    if settings.effective_llm_enabled:
+        logger.info(f"[PDF] Both rule-based parsers failed — trying LLM fallback for {url}")
+        llm_result = _extract_with_llm_text(markdown[:6000], url, source_label="pdf_llm")
+        if llm_result:
+            validated_single = _validate_vendor(llm_result)
+            if validated_single:
+                from backend.tools.vendor_registry import register_vendor
+                register_vendor(validated_single)
+                return [validated_single]
+
+    return []
+
+
+@tool
+def extract_vendors_from_pdf(url: str) -> dict:
+    """
+    Extract ALL vendor/exhibitor records from a PDF exhibitor list.
+    Fetches the PDF via Jina AI Reader (no API key required) and parses the
+    numbered list format common in defense/industry expo exhibitor PDFs.
+
+    Use this when you find a PDF link like:
+      /exhibitor-list/companies.pdf
+      /data/participating-companies.pdf
+
+    ALL extracted vendors are AUTOMATICALLY saved to the global registry.
+    You do NOT need to pass them to deduplicate_vendors or export tools manually.
+
+    Returns: summary dict with keys:
+      - "registered": number of vendors extracted from this PDF
+      - "total_in_registry": total vendors accumulated so far (all sources)
+      - "sample": first 3 vendor records as preview
+      - "message": human-readable summary
+    """
+    vendors = _extract_vendors_from_pdf(url)
+    from backend.tools.vendor_registry import get_count
+    total = get_count()
+    sample = vendors[:3]
+    return {
+        "registered": len(vendors),
+        "total_in_registry": total,
+        "sample": sample,
+        "message": (
+            f"{len(vendors)} vendors extracted from PDF and added to registry. "
+            f"Registry now has {total} vendors total."
+        ),
+    }
+
+
+@tool
+def run_extraction_pipeline(url: str, event_context: dict = None) -> dict:
+    """
+    Run the full extraction pipeline on a URL. Automatically fetches HTML from
+    internal cache (populated by fetch_page/fetch_pages_batch) or re-fetches if
+    not cached. Runs schema_org → rule_based → Jina Reader + LLM fallback.
+    If JINA_API_KEY is set, uses Jina AI Reader for clean markdown before LLM.
+    Pass url only. Returns vendor dict with name, website, email, phone, country, etc.
+
+    Extracted vendors are AUTOMATICALLY saved to the global registry.
+    You do NOT need to collect or pass them manually.
+
+    NOTE: For PDF URLs (ending in .pdf), call extract_vendors_from_pdf(url) instead
+    to get ALL vendors from the PDF list (potentially hundreds of records).
+    """
+    import asyncio
+    from backend.tools.fetch_tools import get_cached_html, fetch_page_async
+    from backend.tools.vendor_registry import register_vendor
+
+    def _reg(v: dict) -> dict:
+        """Register a vendor and return it (pass-through helper)."""
+        if v:
+            register_vendor(v)
+        return v
+
+    # ── PDF shortcut ──────────────────────────────────────────────────────────
+    if url.lower().split("?")[0].rstrip("/").endswith(".pdf"):
+        logger.info(f"[EXTRACT] PDF URL detected — use extract_vendors_from_pdf for full list. Extracting first vendor only: {url}")
+        vendors = _extract_vendors_from_pdf(url)
+        # _extract_vendors_from_pdf already registers all vendors; just return first
+        return vendors[0] if vendors else {}
+
+    html = get_cached_html(url)
+    if not html:
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+                is_running = loop.is_running()
+            except RuntimeError:
+                is_running = False
+            if is_running:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    res = pool.submit(asyncio.run, fetch_page_async(url)).result(timeout=60)
+            else:
+                res = asyncio.run(fetch_page_async(url))
+            html = res.get("html", "")
+        except Exception as e:
+            logger.warning(f"[EXTRACT] Failed to fetch {url}: {e}")
+            return {}
+
     if not html:
         return {}
 
     settings = get_settings()
     event_ctx = event_context or {}
 
-    result = extract_schema_org.invoke({"html": html, "url": url})
+    result = _extract_schema_org(html, url)
     if _count_populated(result) >= settings.min_vendor_fields:
         if event_ctx:
             result.update({k: v for k, v in event_ctx.items() if v and not result.get(k)})
-        return validate_vendor.invoke({"vendor": result})
+        return _reg(_validate_vendor(result))
 
-    rule_result = extract_rule_based.invoke({"html": html, "url": url})
+    rule_result = _extract_rule_based(html, url)
     if _count_populated(rule_result) >= settings.min_vendor_fields:
-        merged = merge_vendor_data.invoke({"sources": [result, rule_result]})
+        merged = _merge_vendor_data([result, rule_result])
         if event_ctx:
             merged.update({k: v for k, v in event_ctx.items() if v and not merged.get(k)})
-        return validate_vendor.invoke({"vendor": merged})
+        return _reg(_validate_vendor(merged))
 
-    combined = merge_vendor_data.invoke({"sources": [r for r in [result, rule_result] if r]})
-    if settings.effective_llm_enabled and _count_populated(combined) < settings.min_vendor_fields:
+    combined = _merge_vendor_data([r for r in [result, rule_result] if r])
+    if _count_populated(combined) < settings.min_vendor_fields:
         context_str = event_ctx.get("event_name", "") if event_ctx else ""
-        llm_result = extract_with_llm.invoke({"html": html, "url": url, "context": context_str})
-        if llm_result:
-            combined = merge_vendor_data.invoke({"sources": [combined, llm_result]})
+
+        # Prefer Jina AI Reader (clean markdown → LLM) over raw HTML → LLM
+        # Jina works without API key (free, rate-limited); key only needed for higher limits
+        if settings.effective_llm_enabled:
+            logger.info(f"[EXTRACT] Rule-based insufficient — trying Jina Reader for {url}")
+            jina_result = _extract_with_jina_llm(url, context_str)
+            if jina_result:
+                combined = _merge_vendor_data([combined, jina_result])
+            else:
+                # Jina unavailable — fallback to raw HTML
+                llm_result = _extract_with_llm(html, url, context_str)
+                if llm_result:
+                    combined = _merge_vendor_data([combined, llm_result])
 
     if event_ctx:
         combined.update({k: v for k, v in event_ctx.items() if v and not combined.get(k)})
 
-    return validate_vendor.invoke({"vendor": combined})
+    return _reg(_validate_vendor(combined))
 
+
+from backend.tools.vendor_registry import get_vendor_count
+from backend.tools.dynamic_parser_tool import generate_and_run_parser
 
 ALL_EXTRACT_TOOLS = [
-    extract_schema_org,
-    extract_rule_based,
-    extract_with_llm,
-    merge_vendor_data,
-    validate_vendor,
     run_extraction_pipeline,
+    discover_vendor_urls,
+    extract_vendors_from_pdf,
+    get_vendor_count,
+    generate_and_run_parser,
 ]

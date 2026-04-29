@@ -15,6 +15,7 @@ from rich.progress import (
     MofNCompleteColumn,
 )
 from rich.live import Live
+from rich.status import Status
 from rich.layout import Layout
 from rich.text import Text
 from rich.columns import Columns
@@ -316,6 +317,66 @@ def print_info(context: str, message: str) -> None:
     console.print(
         f"  [{THEME['info']}][INFO]   [{THEME['info']}]  "
         f"[dim]{_safe(context, 20)}[/dim]  {_safe(message, 80)}",
+        highlight=False,
+    )
+
+
+def print_thinking(agent: str, thought: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    console.print(
+        f"  [dim]{ts}[/dim]  [dim italic]berpikir[/dim italic]  "
+        f"[dim]{_safe(agent, 18):<18}[/dim]  [dim italic]{_safe(thought, 100)}[/dim italic]",
+        highlight=False,
+    )
+
+
+_status_instance: Optional[Status] = None
+
+
+def start_thinking() -> None:
+    global _status_instance
+    _status_instance = Status(
+        "  [dim italic]Berpikir...[/dim italic]",
+        console=console,
+        spinner="dots",
+    )
+    _status_instance.start()
+
+
+def update_thinking(text: str) -> None:
+    if _status_instance:
+        _status_instance.update(f"  [dim italic]{escape(text[:100])}[/dim italic]")
+
+
+def stop_thinking(final_text: str = "") -> None:
+    global _status_instance
+    if _status_instance:
+        _status_instance.stop()
+        _status_instance = None
+    if final_text and final_text.strip():
+        console.print(
+            f"\n  [white]{escape(final_text.strip()[:300])}[/white]\n",
+            highlight=False,
+        )
+
+
+def print_tool_start(tool_name: str, args: dict) -> None:
+    arg_preview = "  ".join(
+        f"[dim]{k}[/dim]=[dim white]{escape(str(v)[:60])}[/dim white]"
+        for k, v in list(args.items())[:3]
+    )
+    console.print(
+        f"  [bold cyan][TOOL]  [/bold cyan]"
+        f"[bold white]{tool_name}[/bold white]  {arg_preview}",
+        highlight=False,
+    )
+
+
+def print_tool_end(tool_name: str, result_summary: str) -> None:
+    console.print(
+        f"  [dim green][TOOL]  [/dim green]"
+        f"[dim]{tool_name}[/dim]  "
+        f"[dim green]selesai: {escape(result_summary[:100])}[/dim green]",
         highlight=False,
     )
 

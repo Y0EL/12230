@@ -4,7 +4,7 @@ from loguru import logger
 
 from backend.agents.base_agent import BaseAgent
 from backend.tools.search_tools import search_exhibitor_events, search_vendor_directory, ALL_SEARCH_TOOLS
-from backend.utils.display import print_discover_start, print_discover_result, print_warning
+from backend.utils.display import print_discover_start, print_discover_result, print_warning, print_thinking
 
 
 class SearchAgent(BaseAgent):
@@ -21,17 +21,21 @@ class SearchAgent(BaseAgent):
             logger.error("[SearchAgent] No query provided")
             return {"seed_urls": [], "query": query, "error": "No query"}
 
+        print_thinking("SearchAgent", f"query diterima: {query!r}")
         print_discover_start(query)
         start = time.time()
 
+        print_thinking("SearchAgent", f"memanggil search_exhibitor_events max_seeds={max_seeds}")
         try:
             results = self._call_tool("search_exhibitor_events", query=query, max_seeds=max_seeds)
         except Exception as e:
             logger.error(f"[SearchAgent] search_exhibitor_events failed: {e}")
             results = []
 
+        print_thinking("SearchAgent", f"seed URLs awal: {len(results)}")
+
         if len(results) < 10:
-            logger.info("[SearchAgent] Supplementing with vendor_directory search")
+            print_thinking("SearchAgent", "hasil kurang dari 10, coba vendor_directory sebagai suplemen")
             try:
                 extra = self._call_tool("search_vendor_directory", query=query)
                 seen = {r["url"] for r in results}
@@ -48,6 +52,7 @@ class SearchAgent(BaseAgent):
         seed_urls = [r["url"] for r in results if r.get("url")]
         elapsed = time.time() - start
 
+        print_thinking("SearchAgent", f"selesai: {len(seed_urls)} seed URLs dalam {elapsed:.1f}s")
         print_discover_result(len(seed_urls), elapsed, seed_urls[:5])
 
         return {

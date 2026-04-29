@@ -12,7 +12,7 @@ from backend.agents.export_agent import ExportAgent
 from backend.core.config import get_settings, CrawlStats
 from backend.utils.display import (
     print_node_transition, print_supervisor_decision,
-    print_info, print_warning, print_error,
+    print_info, print_warning, print_error, print_thinking,
 )
 
 _settings = get_settings()
@@ -64,12 +64,16 @@ def node_discover_seeds(state: CrawlerState) -> dict:
     query = state["query"]
     stats: CrawlStats = state["stats"] or CrawlStats()
 
+    print_thinking("Graph", f"node discover_seeds aktif untuk query: {query!r}")
+
     agent = _get_search_agent()
     result = agent.run({"query": query, "max_seeds": 40})
 
     seed_urls = result.get("seed_urls", [])
+    print_thinking("Graph", f"seed URLs ditemukan: {len(seed_urls)}")
+
     if not seed_urls:
-        print_warning("discover_seeds", "No seeds found — check your query or network")
+        print_warning("discover_seeds", "No seeds found, check your query or network")
 
     stats.domains_crawled.update(seed_urls)
     print_node_transition("discover_seeds", "crawl_batch")
@@ -91,6 +95,8 @@ def node_crawl_batch(state: CrawlerState) -> dict:
     existing_metadata = state.get("page_metadata", {})
     stats: CrawlStats = state["stats"] or CrawlStats()
     current_batch = state.get("current_batch", 0)
+
+    print_thinking("Graph", f"node crawl_batch: {len(seed_urls)} seed URLs masuk antrian")
 
     agent = _get_crawler_agent()
     result = agent.run({
@@ -115,6 +121,7 @@ def node_crawl_batch(state: CrawlerState) -> dict:
     stats.total_errors += result.get("total_errors", 0)
     stats.domains_crawled.update(result.get("visited_urls", set()))
 
+    print_thinking("Graph", f"crawl selesai: {stats.total_crawled} halaman, {len(existing_vendor_pages)} vendor pages")
     print_info("crawl_batch", f"Total vendor pages found: {len(existing_vendor_pages)}")
     print_node_transition("crawl_batch", "extract_vendors")
 
@@ -229,6 +236,8 @@ def node_extract_vendors(state: CrawlerState) -> dict:
     page_metadata = state.get("page_metadata", {})
     stats: CrawlStats = state["stats"] or CrawlStats()
 
+    print_thinking("Graph", f"node extract_vendors: {len(vendor_pages)} halaman akan diekstrak")
+
     if not vendor_pages:
         print_warning("extract_vendors", "No vendor pages — skipping extraction")
         return {"raw_vendors": [], "phase": "enrich"}
@@ -244,6 +253,7 @@ def node_extract_vendors(state: CrawlerState) -> dict:
     new_vendors = result.get("vendors", [])
     updated_stats: CrawlStats = result.get("stats", stats)
 
+    print_thinking("Graph", f"ekstraksi selesai: {len(new_vendors)} vendor ditemukan")
     print_info("extract_vendors", f"Extracted {len(new_vendors)} vendors")
     print_node_transition("extract_vendors", "enrich_domains")
 
@@ -258,6 +268,8 @@ def node_enrich_domains(state: CrawlerState) -> dict:
     print_node_transition("extract_vendors", "enrich_domains")
     raw_vendors = state.get("raw_vendors", [])
     stats: CrawlStats = state["stats"] or CrawlStats()
+
+    print_thinking("Graph", f"node enrich_domains: {len(raw_vendors)} vendor akan di-enrich")
 
     if not raw_vendors:
         print_warning("enrich_domains", "No vendors to enrich")
@@ -286,6 +298,8 @@ def node_export_results(state: CrawlerState) -> dict:
     vendors = state.get("vendors", [])
     query = state.get("query", "export")
     stats: CrawlStats = state["stats"] or CrawlStats()
+
+    print_thinking("Graph", f"node export_results: {len(vendors)} vendor siap ditulis ke Excel")
 
     agent = _get_export_agent()
     result = agent.run({

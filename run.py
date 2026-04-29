@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=ResourceWarning)  # unclosed transport/pipe (Windows asyncio cleanup)
+warnings.filterwarnings("ignore", category=ResourceWarning)
+warnings.filterwarnings("ignore", message=".*unclosed.*pipe.*")
+warnings.filterwarnings("ignore", message=".*I/O operation on closed pipe.*")
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", message=".*chardet.*")
 warnings.filterwarnings("ignore", message=".*charset_normalizer.*")
@@ -17,6 +19,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from loguru import logger
 from backend.core.config import get_settings
 from backend.utils.display import (
     print_banner, print_separator, console,
@@ -27,12 +30,12 @@ from backend.utils.display import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="run.py",
-        description="Mega Crawler Bot — LangGraph + OpenAI vendor listing engine",
+        description="Mega Crawler Bot — LangGraph ReAct Agent + OpenAI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python run.py "cyber defense exhibition global 2025"
-  python run.py "cybersecurity expo europe" --depth 2 --batch 200
+  python run.py "cybersecurity expo europe" --max 50
   python run.py "defense technology summit" --no-enrich --verbose
         """,
     )
@@ -42,18 +45,6 @@ Examples:
         help="Search query describing the type of events/vendors to find",
     )
     parser.add_argument(
-        "--depth", "-d",
-        type=int,
-        default=None,
-        help="Maximum crawl depth (default: from .env MAX_DEPTH)",
-    )
-    parser.add_argument(
-        "--batch", "-b",
-        type=int,
-        default=None,
-        help="Batch size for crawling (default: from .env BATCH_SIZE)",
-    )
-    parser.add_argument(
         "--no-enrich",
         action="store_true",
         help="Skip the domain enrichment phase (faster, less data)",
@@ -61,7 +52,7 @@ Examples:
     parser.add_argument(
         "--no-llm",
         action="store_true",
-        help="Disable LLM fallback entirely (pure zero-LLM mode)",
+        help="[DEPRECATED] ReAct agent requires LLM. This flag will cause an error.",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -83,15 +74,24 @@ Examples:
     return parser.parse_args()
 
 
-def validate_environment(settings) -> bool:
+def validate_environment(settings, args) -> bool:
     ok = True
 
     if not settings.has_openai_key:
-        print_warning(
+        print_error(
             "ENV",
-            "OPENAI_API_KEY not set — LLM fallback disabled. "
-            "Copy .env.example to .env and add your key."
+            "OPENAI_API_KEY tidak ditemukan. ReAct agent membutuhkan OpenAI key. "
+            "Salin .env.example ke .env lalu isi OPENAI_API_KEY."
         )
+        ok = False
+
+    if args.no_llm:
+        print_error(
+            "ENV",
+            "--no-llm tidak kompatibel dengan ReAct agent. "
+            "Agent ini menggunakan LLM untuk semua keputusan."
+        )
+        ok = False
 
     output_path = settings.output_path
     if not output_path.exists():
@@ -102,31 +102,44 @@ def validate_environment(settings) -> bool:
             print_error("ENV", f"Cannot create output directory: {e}")
             ok = False
 
+    # ── Search engine availability ────────────────────────────────────────────
+    openserp_ok = False
     try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        print_error("ENV", "duckduckgo-search not installed. Run: pip install duckduckgo-search")
-        ok = False
+        import httpx
+        resp = httpx.get(
+            f"{settings.openserp_base_url}/google/search",
+            params={"text": "test", "limit": 1},
+            timeout=5,
+        )
+        openserp_ok = resp.status_code == 200
+    except Exception:
+        pass
+
+    tavily_ok = bool(settings.tavily_api_key)
+
+    if tavily_ok:
+        print_info("ENV", f"Search engine: Tavily ✅ (primary)" + (f"  |  OpenSERP ✅ (backup)" if openserp_ok else ""))
+    elif openserp_ok:
+        print_info("ENV", f"Search engine: OpenSERP ✅  {settings.openserp_base_url}  (set TAVILY_API_KEY untuk hasil lebih baik)")
+    else:
+        print_warning(
+            "ENV",
+            "Tidak ada search engine. Set TAVILY_API_KEY di .env, atau jalankan OpenSERP:\n"
+            "    docker run -p 127.0.0.1:7000:7000 -it karust/openserp serve -a 0.0.0.0 -p 7000"
+        )
 
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        print_warning("ENV", "playwright not installed — JS rendering disabled. Run: pip install playwright && playwright install chromium")
+        print_warning("ENV", "playwright not installed. JS rendering disabled. pip install playwright && playwright install chromium")
 
     return ok
 
 
 def apply_overrides(settings, args: argparse.Namespace) -> None:
-    if args.depth is not None:
-        settings.max_depth = args.depth
-    if args.batch is not None:
-        settings.batch_size = args.batch
     if args.max is not None:
         settings.max_total_vendors = args.max
         settings.max_vendors_per_event = args.max
-    if args.no_llm:
-        settings.llm_fallback_enabled = False
-        settings.llm_supervisor_enabled = False
     if args.output:
         settings.output_dir = args.output
     if args.verbose:
@@ -141,31 +154,33 @@ def main() -> int:
     print_banner(args.query)
     print_separator()
 
-    if not validate_environment(settings):
+    if not validate_environment(settings, args):
         console.print("\n[bold red]Environment validation failed. Fix the issues above and retry.[/bold red]\n")
         return 1
 
-    print_info("CONFIG", f"depth={settings.max_depth}  batch={settings.batch_size}  concurrent={settings.max_concurrent_requests}")
-    print_info("CONFIG", f"llm_fallback={settings.effective_llm_enabled}  model={settings.openai_model if settings.has_openai_key else 'N/A'}")
+    print_info("CONFIG", f"model={settings.openai_model}  max_vendors={settings.max_total_vendors}")
+    print_info("CONFIG", f"enrich={'off' if args.no_enrich else 'on'}")
+    pdf_parser = "Firecrawl ✅" if settings.has_firecrawl_key else ("Jina ✅ (free)" if True else "")
+    print_info("CONFIG", f"tavily={'✅' if settings.tavily_api_key else '❌'}  pdf={pdf_parser}  jina={'✅ (key)' if settings.has_jina_key else '✅ (free)'}  llm={'✅' if settings.effective_llm_enabled else '❌'}")
     print_info("CONFIG", f"output={settings.output_path}")
     print_separator()
 
     start_time = time.time()
 
     try:
-        if args.no_enrich:
-            console.print("[dim]Enrichment phase disabled (--no-enrich)[/dim]\n")
-            _patch_skip_enrich()
-
         from backend.graph.workflow import run_crawler
-        result = run_crawler(args.query)
+        result = run_crawler(
+            args.query,
+            max_vendors=settings.max_total_vendors,
+            skip_enrich=args.no_enrich,
+        )
 
     except KeyboardInterrupt:
         console.print("\n\n[bold yellow]Interrupted by user. Partial results may be in output/[/bold yellow]\n")
         return 130
     except Exception as e:
+        logger.exception("Crawler failed")
         print_error("MAIN", f"Crawler failed: {e}")
-        import traceback
         if args.verbose:
             console.print_exception()
         return 1
@@ -198,17 +213,6 @@ def main() -> int:
     console.print()
 
     return 0
-
-
-def _patch_skip_enrich() -> None:
-    import backend.graph.nodes as nodes_module
-
-    def _skip_enrich(state) -> dict:
-        raw_vendors = state.get("raw_vendors", [])
-        print_info("enrich_domains", "Skipped (--no-enrich)")
-        return {"vendors": raw_vendors, "phase": "export"}
-
-    nodes_module.node_enrich_domains = _skip_enrich
 
 
 if __name__ == "__main__":

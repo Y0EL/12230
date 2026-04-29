@@ -254,19 +254,30 @@ def _build_dedup_check_sheet(ws, vendors: list[dict]) -> None:
 
 
 @tool
-def export_to_excel(vendors: list[dict], query: str, stats: dict = None) -> str:
+def export_to_excel(vendors: list[dict] = [], query: str = "", stats: dict = None) -> str:
     """
     Export vendor list to a formatted Excel file with multiple sheets:
     Sheet 1: All vendors with colored rows by extraction method
     Sheet 2: Run statistics and country/category breakdown
     Sheet 3: Duplicate check
 
+    If vendors list is empty (or not provided), exports from the global registry.
+    Always pass query = the original user query string.
+
     Returns the absolute file path of the created Excel file.
     """
+    from backend.tools.vendor_registry import get_all_vendors
     settings = get_settings()
-    if not vendors:
-        logger.warning("No vendors to export")
+
+    # Prefer registry over passed vendors (registry always has the full, deduped set)
+    registry = get_all_vendors()
+    effective_vendors = registry if registry else vendors
+
+    if not effective_vendors:
+        logger.warning("No vendors to export (registry empty and no vendors passed)")
         return ""
+
+    vendors = effective_vendors
 
     stats = stats or {}
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -301,14 +312,24 @@ def export_to_excel(vendors: list[dict], query: str, stats: dict = None) -> str:
 
 
 @tool
-def export_to_csv(vendors: list[dict], query: str) -> str:
+def export_to_csv(vendors: list[dict] = [], query: str = "") -> str:
     """
     Export vendor list to a CSV file.
+    If vendors list is empty (or not provided), exports from the global registry.
+    Always pass query = the original user query string.
     Returns the absolute file path of the created CSV file.
     """
+    from backend.tools.vendor_registry import get_all_vendors
     settings = get_settings()
-    if not vendors:
+
+    # Prefer registry over passed vendors
+    registry = get_all_vendors()
+    effective_vendors = registry if registry else vendors
+
+    if not effective_vendors:
         return ""
+
+    vendors = effective_vendors
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_query = re.sub(r'[^\w\s-]', '', query)[:30].strip().replace(" ", "_")
@@ -327,11 +348,11 @@ def export_to_csv(vendors: list[dict], query: str) -> str:
     return str(output_path)
 
 
-@tool
-def deduplicate_vendors(vendors: list[dict]) -> list[dict]:
+def _do_deduplicate(vendors: list[dict]) -> list[dict]:
     """
-    Remove duplicate vendors based on name similarity and website domain.
-    Returns deduplicated list, keeping the record with highest confidence_score.
+    Internal deduplication logic.
+    Remove duplicates based on name similarity and website domain.
+    Keeps the record with highest confidence_score and merges fields.
     """
     from urllib.parse import urlparse
     from collections import defaultdict
@@ -382,8 +403,44 @@ def deduplicate_vendors(vendors: list[dict]) -> list[dict]:
             deduped.append(best)
 
     deduped.sort(key=lambda v: v.get("confidence_score", 0), reverse=True)
-    logger.info(f"Deduplicated: {len(vendors)} → {len(deduped)} vendors")
     return deduped
+
+
+@tool
+def deduplicate_vendors(vendors: list[dict] = []) -> dict:
+    """
+    Deduplicate all collected vendors.
+
+    If vendors list is empty (or not provided), operates on the global registry
+    (which contains ALL vendors extracted during this run). This is the recommended
+    usage — call without arguments after crawling is done.
+
+    After deduplication, the registry is updated with the clean list so that
+    export_to_excel and export_to_csv will use the deduplicated data.
+
+    Returns a summary dict (NOT the full list, to avoid context overflow):
+      {"original_count": N, "deduped_count": M, "message": "..."}
+    """
+    from backend.tools.vendor_registry import get_all_vendors, replace_all
+
+    # Prefer registry (full set) over whatever partial list agent might pass
+    registry = get_all_vendors()
+    source = registry if registry else vendors
+
+    if not source:
+        return {"original_count": 0, "deduped_count": 0, "message": "No vendors to deduplicate."}
+
+    deduped = _do_deduplicate(source)
+
+    # Update the registry with the deduplicated list so exports use clean data
+    replace_all(deduped)
+
+    msg = (
+        f"Deduplication complete: {len(source)} -> {len(deduped)} unique vendors. "
+        f"Registry updated. Call export_to_excel(query='...') to save."
+    )
+    logger.info(f"Deduplicated: {len(source)} -> {len(deduped)} vendors (registry updated)")
+    return {"original_count": len(source), "deduped_count": len(deduped), "message": msg}
 
 
 ALL_EXPORT_TOOLS = [export_to_excel, export_to_csv, deduplicate_vendors]

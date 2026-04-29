@@ -3,6 +3,7 @@ import random
 from typing import Optional
 from urllib.parse import urlparse
 
+import httpx
 from langchain_core.tools import tool
 from loguru import logger
 from rich.console import Console
@@ -14,22 +15,28 @@ from rich.progress import (
 from backend.core.config import get_settings
 
 _console = Console(stderr=False)
-
 _settings = get_settings()
 
+_ENGINE_TIMEOUT: dict[str, int] = {
+    "google":     45,
+    "baidu":      90,
+    "bing":       45,
+    "duckduckgo": 45,
+}
+
 SEARCH_TEMPLATES = [
-    '{query} exhibitors list site',
-    '{query} vendors directory',
-    '{query} expo participants 2024 2025',
-    '{query} conference exhibitors',
-    '{query} tradeshow companies list',
-    '{query} summit sponsors vendors',
-    'site:10times.com {query}',
-    'site:eventbrite.com {query} exhibitors',
-    'site:expodatabase.com {query}',
-    '{query} floor plan exhibitors',
-    '{query} expo hall vendors directory',
-    '{query} event exhibitor list filetype:html',
+    "{query} exhibitors list",
+    "{query} vendors directory",
+    "{query} expo participants 2025 2026",
+    "{query} conference exhibitors",
+    "{query} tradeshow companies list",
+    "{query} summit sponsors vendors",
+    "site:10times.com {query}",
+    "site:expodatabase.com {query}",
+    "{query} floor plan exhibitors",
+    "{query} expo hall vendors directory",
+    "{query} event exhibitor list",
+    "{query} technology providers directory",
 ]
 
 EVENT_SITE_DOMAINS = [
@@ -53,75 +60,221 @@ CYBERSECURITY_EVENT_KEYWORDS = [
     "pentest", "red team", "blue team", "ciso",
 ]
 
-# Multi-region config: keyword patterns → (ddgs_region, translate_to, label)
-# Mendukung keyword Indonesia DAN Inggris
 REGION_MAP = [
-    # East Asia
-    (["china", "cina", "tiongkok", "beijing", "shanghai", "shenzhen", "guangzhou"],
-     "cn-zh", "zh-CN", "China"),
-    (["jepang", "japan", "tokyo", "osaka", "kyoto"],
-     "jp-ja", "ja", "Japan"),
-    (["korea", "korean", "seoul", "busan"],
-     "kr-ko", "ko", "Korea"),
-
-    # Americas
-    (["usa", "us ", " us,", "america", "united states", "amerika",
-      "new york", "washington", "los angeles", "san francisco", "chicago"],
-     "us-en", "en", "USA"),
-
-    # Europe (general)
-    (["eropa", "europe", "european", "eu ", "german", "jerman", "prancis", "france",
-      "inggris", "uk ", "belanda", "netherlands", "italy", "italia", "spain", "spanyol",
-      "sweden", "swedia", "poland", "polandia", "belanda", "brussels"],
-     "xl-en", "en", "Europe"),
-
-    # Greece (terpisah supaya lebih akurat)
-    (["greece", "greek", "yunani", "athens", "athena", "hellenic"],
-     "gr-el", "en", "Greece"),
-
-    # Russia / Eastern Europe
-    (["russia", "rusia", "russian", "moskow", "moscow", "st. petersburg"],
-     "ru-ru", "ru", "Russia"),
-
-    # South Asia
-    (["india", "mumbai", "new delhi", "delhi", "bangalore", "bengaluru", "hyderabad"],
-     "in-en", "en", "India"),
-    (["pakistan", "karachi", "islamabad", "lahore", "pakistani"],
-     "pk-en", "en", "Pakistan"),
-
-    # Southeast Asia
-    (["singapura", "singapore", "asia tenggara", "southeast asia", "asean",
-      "malaysia", "thailand", "filipina", "philippines", "vietnam"],
-     "sg-en", "en", "Southeast Asia"),
-
-    # Oceania
-    (["oceania", "australia", "new zealand", "auckland", "sydney", "melbourne",
-      "pacific", "pasifik", "papua"],
-     "au-en", "en", "Oceania"),
-
-    # Middle East
-    (["arab", "arabic", "saudi", "dubai", "uae", "timur tengah", "middle east",
-      "qatar", "kuwait", "bahrain", "oman", "abu dhabi"],
-     "xa-en", "en", "Middle East"),
-
-    # Asia general (fallback jika tidak spesifik)
-    (["asia ", " asia", ",asia", "asian"],
-     "wt-wt", "en", "Asia"),
+    {
+        "keywords": ["china", "cina", "tiongkok", "beijing", "shanghai", "shenzhen", "guangzhou"],
+        "engine": "baidu",
+        "extra_params": {},
+        "label": "China",
+    },
+    {
+        "keywords": ["jepang", "japan", "tokyo", "osaka", "kyoto"],
+        "engine": "google",
+        "extra_params": {"gl": "jp", "hl": "ja"},
+        "label": "Japan",
+    },
+    {
+        "keywords": ["korea", "korean", "seoul", "busan"],
+        "engine": "google",
+        "extra_params": {"gl": "kr", "hl": "ko"},
+        "label": "Korea",
+    },
+    {
+        "keywords": [
+            "usa", "us ", " us,", "america", "united states", "amerika",
+            "new york", "washington", "los angeles", "san francisco", "chicago",
+        ],
+        "engine": "google",
+        "extra_params": {"gl": "us", "hl": "en"},
+        "label": "USA",
+    },
+    {
+        "keywords": [
+            "eropa", "europe", "european", "eu ", "german", "jerman", "prancis", "france",
+            "inggris", "uk ", "belanda", "netherlands", "italy", "italia", "spain", "spanyol",
+            "sweden", "swedia", "poland", "polandia", "brussels",
+        ],
+        "engine": "google",
+        "extra_params": {},
+        "label": "Europe",
+    },
+    {
+        "keywords": ["greece", "greek", "yunani", "athens", "athena", "hellenic"],
+        "engine": "google",
+        "extra_params": {"gl": "gr", "hl": "el"},
+        "label": "Greece",
+    },
+    {
+        "keywords": ["russia", "rusia", "russian", "moskow", "moscow", "st. petersburg"],
+        "engine": "google",
+        "extra_params": {"gl": "ru", "hl": "ru"},
+        "label": "Russia",
+    },
+    {
+        "keywords": ["india", "mumbai", "new delhi", "delhi", "bangalore", "bengaluru", "hyderabad"],
+        "engine": "google",
+        "extra_params": {"gl": "in", "hl": "en"},
+        "label": "India",
+    },
+    {
+        "keywords": ["pakistan", "karachi", "islamabad", "lahore", "pakistani"],
+        "engine": "google",
+        "extra_params": {"gl": "pk", "hl": "en"},
+        "label": "Pakistan",
+    },
+    {
+        "keywords": [
+            "singapura", "singapore", "asia tenggara", "southeast asia", "asean",
+            "malaysia", "thailand", "filipina", "philippines", "vietnam",
+        ],
+        "engine": "google",
+        "extra_params": {"gl": "sg", "hl": "en"},
+        "label": "Southeast Asia",
+    },
+    {
+        "keywords": [
+            "oceania", "australia", "new zealand", "auckland", "sydney", "melbourne",
+            "pacific", "pasifik", "papua",
+        ],
+        "engine": "google",
+        "extra_params": {"gl": "au", "hl": "en"},
+        "label": "Oceania",
+    },
+    {
+        "keywords": [
+            "arab", "arabic", "saudi", "dubai", "uae", "timur tengah", "middle east",
+            "qatar", "kuwait", "bahrain", "oman", "abu dhabi",
+        ],
+        "engine": "google",
+        "extra_params": {"gl": "ae", "hl": "ar"},
+        "label": "Middle East",
+    },
+    {
+        "keywords": ["asia ", " asia", ",asia", "asian"],
+        "engine": "google",
+        "extra_params": {},
+        "label": "Asia",
+    },
 ]
 
-# Jika query mengandung kata "global/worldwide/world/seluruh dunia" → aktifkan semua region
 GLOBAL_KEYWORDS = [
     "global", "worldwide", "world", "seluruh dunia", "all regions",
     "covers over", "international", "internasional",
 ]
 
+_GLOBAL_REGION: dict = {"engine": "google", "extra_params": {}, "label": "Global"}
+
+_openserp_available: Optional[bool] = None
+_tavily_available: Optional[bool] = None
+
+
+def _check_tavily() -> bool:
+    global _tavily_available
+    if _tavily_available is not None:
+        return _tavily_available
+    key = _settings.tavily_api_key
+    if not key:
+        _tavily_available = False
+        return False
+    _tavily_available = True
+    return True
+
+
+def _tavily_search(query: str, max_results: int = 10) -> list[dict]:
+    """Search via Tavily API. Returns list of {url, title, snippet}."""
+    key = _settings.tavily_api_key
+    if not key:
+        return []
+    body = {
+        "api_key":      key,
+        "query":        query,
+        "max_results":  max_results,
+        "search_depth": "basic",
+        "include_answer":      False,
+        "include_raw_content": False,
+    }
+    try:
+        resp = httpx.post("https://api.tavily.com/search", json=body, timeout=30)
+        if resp.status_code == 200:
+            items = resp.json().get("results", [])
+            return [
+                {
+                    "url":     r.get("url", ""),
+                    "title":   r.get("title", ""),
+                    "snippet": r.get("content", "")[:300],
+                }
+                for r in items if r.get("url")
+            ]
+        logger.warning(f"[TAVILY] HTTP {resp.status_code} for query: {query[:50]}")
+    except Exception as e:
+        logger.warning(f"[TAVILY] Error: {e}")
+    return []
+
+
+def _check_openserp() -> bool:
+    global _openserp_available
+    if _openserp_available is not None:
+        return _openserp_available
+    base = _settings.openserp_base_url
+    try:
+        resp = httpx.get(
+            f"{base}/google/search",
+            params={"text": "test", "limit": 1},
+            timeout=10,
+        )
+        _openserp_available = resp.status_code == 200
+    except Exception:
+        _openserp_available = False
+    return _openserp_available
+
+
+def _openserp_search(
+    engine: str,
+    query: str,
+    limit: int = 30,
+    extra_params: Optional[dict] = None,
+) -> list[dict]:
+    base = _settings.openserp_base_url
+    params: dict = {"text": query, "limit": limit}
+    if extra_params:
+        params.update(extra_params)
+    timeout = _ENGINE_TIMEOUT.get(engine, 45)
+    try:
+        resp = httpx.get(
+            f"{base}/{engine}/search",
+            params=params,
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"OpenSERP {engine} returned {resp.status_code} for query: {query[:50]}")
+            return []
+        data = resp.json()
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("organic", data.get("results", []))
+        else:
+            return []
+        results = []
+        for item in items:
+            url = item.get("url", item.get("link", ""))
+            if not url:
+                continue
+            results.append({
+                "title":   item.get("title", ""),
+                "url":     url,
+                "snippet": item.get("description", item.get("snippet", "")),
+            })
+        return results
+    except httpx.TimeoutException:
+        logger.warning(f"OpenSERP {engine} timeout ({timeout}s) for query: {query[:50]}")
+        return []
+    except Exception as e:
+        logger.warning(f"OpenSERP {engine} error for query: {query[:50]}: {e}")
+        return []
+
 
 def _extract_core_query(query: str) -> str:
-    """
-    Ambil bagian inti query untuk diterjemahkan.
-    Kalau ada koma (biasanya list region/negara di belakang), ambil segmen pertama.
-    Contoh: "cyber defense 2026, CHINA, USA, OCEANIA" → "cyber defense 2026"
-    """
     if "," in query:
         core = query.split(",")[0].strip()
     else:
@@ -129,78 +282,31 @@ def _extract_core_query(query: str) -> str:
     return core[:100].strip()
 
 
-def _translate_query(text: str, src: str, dest: str) -> str:
-    if not text or src == dest:
-        return text
-    try:
-        from deep_translator import GoogleTranslator
-        return GoogleTranslator(source=src, target=dest).translate(text[:500]) or text
-    except Exception as e:
-        logger.debug(f"Translation failed ({src}→{dest}), using original: {e}")
-        return text
-
-
-def _detect_regions(query: str) -> list[tuple[str, str, str]]:
-    """
-    Deteksi target region dari teks query (mendukung keyword Indonesia & Inggris).
-    Jika query mengandung kata global/worldwide → aktifkan semua region.
-    Selalu include Global (wt-wt) sebagai entry pertama.
-    Returns list of (ddgs_region, translate_to, label).
-    """
+def _detect_regions(query: str) -> list[dict]:
     query_lower = query.lower()
-
-    # Global mode: aktifkan semua region
     is_global_mode = any(kw in query_lower for kw in GLOBAL_KEYWORDS)
 
     if is_global_mode:
-        results = [("wt-wt", "en", "Global")]
-        seen = {("wt-wt", "en", "Global")}
-        for _, ddgs_region, translate_to, label in REGION_MAP:
-            entry = (ddgs_region, translate_to, label)
-            if entry not in seen:
+        results = [_GLOBAL_REGION]
+        seen_labels = {_GLOBAL_REGION["label"]}
+        for entry in REGION_MAP:
+            if entry["label"] not in seen_labels:
                 results.append(entry)
-                seen.add(entry)
+                seen_labels.add(entry["label"])
         return results
 
-    # Normal mode: deteksi berdasarkan keyword
     detected = []
-    for keywords, ddgs_region, translate_to, label in REGION_MAP:
-        if any(kw in query_lower for kw in keywords):
-            detected.append((ddgs_region, translate_to, label))
+    for entry in REGION_MAP:
+        if any(kw in query_lower for kw in entry["keywords"]):
+            detected.append(entry)
 
-    results = [("wt-wt", "en", "Global")]
+    results = [_GLOBAL_REGION]
+    seen_labels = {_GLOBAL_REGION["label"]}
     for entry in detected:
-        if entry not in results:
+        if entry["label"] not in seen_labels:
             results.append(entry)
+            seen_labels.add(entry["label"])
     return results
-
-
-def _ddg_search(query: str, max_results: int = 30, region: str = "wt-wt") -> list[dict]:
-    try:
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            from duckduckgo_search import DDGS
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(
-                query,
-                region=region,
-                safesearch="off",
-                timelimit=None,
-                max_results=max_results,
-            ):
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", ""),
-                })
-                if len(results) >= max_results:
-                    break
-        return results
-    except Exception as e:
-        logger.warning(f"DDG search failed for '{query}' [region={region}]: {e}")
-        return []
 
 
 def _score_seed_url(url: str, title: str = "", snippet: str = "") -> int:
@@ -231,8 +337,8 @@ def _score_seed_url(url: str, title: str = "", snippet: str = "") -> int:
 
 
 def _deduplicate_urls(results: list[dict]) -> list[dict]:
-    seen_domains = set()
-    seen_urls = set()
+    seen_domains: set[str] = set()
+    seen_urls: set[str] = set()
     deduped = []
     for r in results:
         url = r.get("url", "")
@@ -244,63 +350,87 @@ def _deduplicate_urls(results: list[dict]) -> list[dict]:
         if norm_url in seen_urls:
             continue
         seen_urls.add(norm_url)
-        if domain in seen_domains:
-            if r.get("score", 0) < 5:
-                continue
+        if domain in seen_domains and r.get("score", 0) < 5:
+            continue
         seen_domains.add(domain)
         deduped.append(r)
     return deduped
 
 
-def _search_region(query_en: str, query_orig: str, ddgs_region: str,
-                   translate_to: str, label: str, templates: list[str],
-                   max_results_per_template: int = 15) -> list[dict]:
-    """Run search for one region using the appropriate translated query."""
-    if translate_to == "en":
-        query = query_en
-    elif translate_to in ("zh-CN", "ja", "ko", "ru"):
-        # Selalu translate dari English → target, bukan dari Indonesian langsung
-        # supaya benar meski query aslinya Inggris atau Indonesia
-        query = _translate_query(query_en, "en", translate_to)
-        if not query or query == query_en:
-            query = query_en
-    else:
-        query = query_en
-
-    logger.debug(f"[{label}] region={ddgs_region}, query={query[:60]}")
+def _search_region(
+    query: str,
+    region: dict,
+    templates: list[str],
+    max_results_per_template: int = 15,
+) -> list[dict]:
+    engine = region["engine"]
+    extra_params = region.get("extra_params", {})
+    label = region["label"]
 
     results = []
     for template in templates:
         search_q = template.format(query=query)
-        raw = _ddg_search(search_q, max_results=max_results_per_template, region=ddgs_region)
+        raw = _openserp_search(engine, search_q, limit=max_results_per_template, extra_params=extra_params)
         for r in raw:
             r["region_label"] = label
-            r["region_code"] = ddgs_region
+            r["region_engine"] = engine
         results.extend(raw)
         time.sleep(random.uniform(0.4, 1.0))
 
     return results
 
 
+def _search_with_tavily_fallback(query: str, max_seeds: int = 40) -> list[dict]:
+    """
+    Search using Tavily across multiple query variants.
+    Used when OpenSERP is unavailable.
+    """
+    templates_used = SEARCH_TEMPLATES[:6]
+    core = _extract_core_query(query)
+    all_results: list[dict] = []
+
+    for template in templates_used:
+        search_q = template.format(query=core)
+        raw = _tavily_search(search_q, max_results=10)
+        for r in raw:
+            r["score"] = _score_seed_url(r["url"], r.get("title", ""), r.get("snippet", ""))
+            r["domain"] = urlparse(r["url"]).netloc.lower()
+            r["region_label"] = "Global (Tavily)"
+            r["region_engine"] = "tavily"
+        all_results.extend(raw)
+        time.sleep(0.5)
+
+    all_results = _deduplicate_urls(all_results)
+    all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    logger.info(f"[TAVILY] {len(all_results)} seed URLs dari {len(templates_used)} queries")
+    return all_results[:max_seeds]
+
+
 @tool
 def search_exhibitor_events(query: str, max_seeds: int = 40) -> list[dict]:
     """
-    Search for exhibitor event pages related to the query using DuckDuckGo.
-    Auto-detects regional keywords (supports Indonesian) and searches multiple
-    regional DDG instances (cn-zh, jp-ja, kr-ko, etc.) when relevant.
+    Search for exhibitor event pages related to the query.
+    Uses OpenSERP (multi-region) when available, automatically falls back to Tavily.
     Returns a list of seed URLs scored by relevance to vendor/exhibitor listings.
     Each result has: url, title, snippet, score, domain, region_label.
     """
-    # Ambil core query (strip list region di belakang koma) sebelum translate
     core = _extract_core_query(query)
-    query_en = _translate_query(core, "auto", "en")
-    if not query_en or query_en == core:
-        query_en = core
+    query_en = core
+
+    # ── Tavily primary — OpenSERP supplementary ──────────────────────────────
+    if _check_tavily():
+        logger.info("[SEARCH] Menggunakan Tavily sebagai search engine utama")
+        tavily_results = _search_with_tavily_fallback(query, max_seeds)
+        if tavily_results:
+            return tavily_results
+        logger.info("[SEARCH] Tavily 0 hasil — fallback ke OpenSERP")
+
+    if not _check_openserp():
+        logger.error("Tidak ada search engine tersedia (Tavily kosong, OpenSERP down)")
+        return []
 
     regions = _detect_regions(query)
-    logger.info(f"Multi-region search: {[r[2] for r in regions]} for query: {query[:60]}")
 
-    # Makin banyak region → kurangi template per region supaya tidak terlalu lambat
     n_regions = len(regions)
     if n_regions <= 2:
         templates_to_use = SEARCH_TEMPLATES[:6]
@@ -312,30 +442,26 @@ def search_exhibitor_events(query: str, max_seeds: int = 40) -> list[dict]:
         templates_to_use = SEARCH_TEMPLATES[:3]
         max_per_template = 8
 
-    logger.info(f"Multi-region: {n_regions} region × {len(templates_to_use)} template × {max_per_template} results")
-    all_results = []
+    all_results: list[dict] = []
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold cyan][DISCOVER][/bold cyan] {task.description}"),
         BarColumn(bar_width=28),
         MofNCompleteColumn(),
-        TextColumn("[dim]•[/dim] {task.fields[found]} URLs"),
+        TextColumn("[dim]{task.fields[found]} URLs[/dim]"),
         TimeElapsedColumn(),
         console=_console,
         transient=True,
     ) as progress:
-        task = progress.add_task(
-            f"starting...", total=n_regions, found=0
-        )
-        for ddgs_region, translate_to, label in regions:
-            progress.update(task, description=f"[{label}]  ({ddgs_region})", found=len(all_results))
+        task = progress.add_task("starting...", total=n_regions, found=0)
+        for region in regions:
+            label = region["label"]
+            engine = region["engine"]
+            progress.update(task, description=f"[{label}] ({engine})", found=len(all_results))
             region_results = _search_region(
-                query_en=query_en,
-                query_orig=query,
-                ddgs_region=ddgs_region,
-                translate_to=translate_to,
-                label=label,
+                query=query_en,
+                region=region,
                 templates=templates_to_use,
                 max_results_per_template=max_per_template,
             )
@@ -349,11 +475,12 @@ def search_exhibitor_events(query: str, max_seeds: int = 40) -> list[dict]:
     all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
     top_results = all_results[:max_seeds]
 
-    region_counts = {}
+    region_counts: dict[str, int] = {}
     for r in top_results:
         lbl = r.get("region_label", "Global")
         region_counts[lbl] = region_counts.get(lbl, 0) + 1
-    logger.info(f"Found {len(top_results)} seed URLs — breakdown: {region_counts}")
+
+    logger.info(f"Found {len(top_results)} seed URLs: {region_counts}")
 
     return top_results
 
@@ -368,19 +495,23 @@ def search_vendor_directory(
     Search specifically for vendor directories, exhibitor lists, and company directories
     related to a topic. Returns scored URLs.
     """
-    year_str = year or "2024 2025"
-    query_en = _translate_query(query, "id", "en")
+    year_str = year or "2025 2026"
     search_queries = [
-        f"{query_en} exhibitor list {year_str}",
-        f"{query_en} vendor directory {region}",
-        f"{query_en} companies participating {year_str}",
-        f"{query_en} technology providers {region}",
-        f"site:linkedin.com/company {query_en} exhibitor",
+        f"{query} exhibitor list {year_str}",
+        f"{query} vendor directory {region}",
+        f"{query} companies participating {year_str}",
+        f"{query} technology providers {region}",
     ]
 
-    all_results = []
+    all_results: list[dict] = []
+
+    use_tavily = _check_tavily()  # Tavily primary, OpenSERP supplementary
+
     for sq in search_queries[:3]:
-        results = _ddg_search(sq, max_results=20)
+        if use_tavily:
+            results = _tavily_search(sq, max_results=10)
+        else:
+            results = _openserp_search("google", sq, limit=20)
         for r in results:
             r["score"] = _score_seed_url(r["url"], r.get("title", ""), r.get("snippet", ""))
             r["domain"] = urlparse(r["url"]).netloc.lower()
@@ -403,11 +534,11 @@ def search_company_info(company_name: str, domain: str = "") -> dict:
         f'"{company_name}" company cybersecurity defense',
     ]
     if domain:
-        queries.insert(0, f'site:{domain} {company_name}')
+        queries.insert(0, f"site:{domain} {company_name}")
 
-    results = []
+    results: list[dict] = []
     for q in queries[:2]:
-        r = _ddg_search(q, max_results=5)
+        r = _openserp_search("google", q, limit=5)
         results.extend(r)
         time.sleep(0.3)
 
@@ -426,10 +557,10 @@ def search_company_info(company_name: str, domain: str = "") -> dict:
             description = snippet[:300]
 
     return {
-        "company_name": company_name,
-        "website": website_url,
-        "linkedin": linkedin_url,
-        "description": description,
+        "company_name":        company_name,
+        "website":             website_url,
+        "linkedin":            linkedin_url,
+        "description":         description,
         "search_results_count": len(results),
     }
 

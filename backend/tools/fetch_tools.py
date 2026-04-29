@@ -1,9 +1,26 @@
 import asyncio
 import random
+import re
+import sys
 import time
 import hashlib
+import warnings
 from typing import Optional, Any
 from urllib.parse import urlparse, urljoin
+
+# Suppress harmless Windows asyncio + Playwright subprocess cleanup noise.
+# These fire in __del__ after the event loop is already closed — not real errors.
+def _suppress_playwright_cleanup(exc_info: object) -> None:
+    tp = getattr(exc_info, "exc_type", None)
+    msg = str(getattr(exc_info, "exc_value", ""))
+    if tp in (RuntimeError, ValueError) and any(
+        kw in msg for kw in ("Event loop is closed", "I/O operation on closed pipe")
+    ):
+        return
+    sys.__unraisablehook__(exc_info)
+
+sys.unraisablehook = _suppress_playwright_cleanup
+warnings.filterwarnings("ignore", category=ResourceWarning, message="unclosed transport")
 
 import httpx
 from tenacity import (
@@ -23,9 +40,35 @@ _ua = UserAgent(fallback="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 _settings = get_settings()
 
 _response_cache: dict[str, dict] = {}
+_page_html_store: dict[str, str] = {}
 
 _domain_semaphores: dict[str, asyncio.Semaphore] = {}
 _global_semaphore: asyncio.Semaphore | None = None
+
+
+def get_cached_html(url: str) -> str:
+    key = url.rstrip("/").lower()
+    return _page_html_store.get(key, "")
+
+
+def _store_and_strip(result: dict) -> dict:
+    html = result.get("html", "")
+    url = result.get("url", "")
+    final_url = result.get("final_url", url)
+    if html:
+        _page_html_store[url.rstrip("/").lower()] = html
+        if final_url and final_url != url:
+            _page_html_store[final_url.rstrip("/").lower()] = html
+    return {
+        "url": url,
+        "final_url": final_url,
+        "status": result.get("status", 0),
+        "success": result.get("success", False),
+        "content_length": len(html),
+        "is_js_rendered": result.get("is_js_rendered", False),
+        "response_time": result.get("response_time", 0.0),
+        "error": result.get("error", ""),
+    }
 
 
 def _get_global_semaphore() -> asyncio.Semaphore:
@@ -319,15 +362,137 @@ def _needs_playwright(result: dict) -> bool:
         return True
     lower = html.lower()
     js_indicators = [
-        "id=\"root\">", "id=\"app\">", "id=\"__next\"",
-        "react-app", "ng-version", "vue-app",
+        # Next.js (Pages Router)
+        'id="__next"', "data-reactroot",
+        # Next.js (App Router) — /_next/static/ appears in CSS/JS link tags
+        "/_next/static/",
+        # Other SPA frameworks
+        'id="root">', 'id="app">',
+        "react-app", "ng-version", "vue-app", "__nuxt",
+        # Anti-bot / loading gates
         "please enable javascript", "javascript is required",
-        "loading...", "cloudflare", "checking your browser",
-        "<noscript>", "data-reactroot",
+        "cloudflare", "checking your browser",
+        "<noscript>",
     ]
     js_count = sum(1 for ind in js_indicators if ind in lower)
-    content_ratio = len(html.strip()) < 2000
-    return js_count >= 2 or (js_count >= 1 and content_ratio)
+
+    # Text density: strip script/style blocks first (including their inline content),
+    # then strip remaining tags — what's left is only visible text
+    text_stripped = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", html,
+                           flags=re.DOTALL | re.IGNORECASE)
+    text_only = re.sub(r"<[^>]+>", " ", text_stripped)
+    text_only = re.sub(r"\s+", " ", text_only).strip()
+    content_sparse = len(text_only) < 3000
+
+    return js_count >= 2 or (js_count >= 1 and content_sparse)
+
+
+async def _fetch_jina_markdown(url: str) -> str:
+    """
+    Fetch a page (or PDF) via Jina AI Reader (r.jina.ai) and return clean markdown.
+    Works without an API key (free, rate-limited). Key adds higher rate limits.
+    Handles HTML pages and PDFs transparently.
+    """
+    settings = get_settings()
+    jina_url = f"https://r.jina.ai/{url}"
+
+    # Auth header only when key is available — not required
+    headers: dict[str, str] = {
+        "X-Return-Format": "markdown",
+        "Accept": "text/markdown, text/plain",
+    }
+    if settings.has_jina_key:
+        headers["Authorization"] = f"Bearer {settings.jina_api_key}"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(90.0),   # PDFs can be slow
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            resp = await client.get(jina_url)
+            if resp.status_code == 200:
+                text = resp.text.strip()
+                logger.debug(f"[JINA] Fetched {len(text):,} chars from {url}")
+                return text
+            else:
+                logger.warning(f"[JINA] status={resp.status_code} for {url}")
+                return ""
+    except Exception as e:
+        logger.warning(f"[JINA] Failed for {url}: {type(e).__name__}: {e}")
+        return ""
+
+
+async def _fetch_firecrawl_parse(url: str) -> str:
+    """
+    Download a PDF (or any document) from a public URL and parse it via
+    Firecrawl /v2/parse (multipart/form-data).  5x faster than Jina for
+    large PDFs thanks to Firecrawl's Rust engine.
+
+    Requires FIRECRAWL_API_KEY in .env.
+    Falls back gracefully (returns "") if key missing or request fails.
+
+    Flow:
+        1. Download raw bytes from `url` with httpx
+        2. POST bytes to https://api.firecrawl.dev/v2/parse
+        3. Return `data.markdown` from the JSON response
+    """
+    import json as _json
+    settings = get_settings()
+    if not settings.has_firecrawl_key:
+        return ""
+
+    # ── Step 1: download PDF bytes ────────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0),
+            follow_redirects=True,
+            headers={"User-Agent": _ua.random},
+        ) as dl_client:
+            dl_resp = await dl_client.get(url)
+            dl_resp.raise_for_status()
+            pdf_bytes = dl_resp.content
+    except Exception as e:
+        logger.warning(f"[FC-PARSE] Failed to download {url}: {type(e).__name__}: {e}")
+        return ""
+
+    if not pdf_bytes:
+        logger.warning(f"[FC-PARSE] Empty bytes from {url}")
+        return ""
+
+    logger.info(f"[FC-PARSE] Downloaded {len(pdf_bytes):,} bytes from {url}")
+
+    # ── Step 2: POST to Firecrawl /v2/parse ──────────────────────────────────
+    filename = url.rstrip("/").split("/")[-1].split("?")[0] or "document.pdf"
+    parse_options = _json.dumps({
+        "formats": [{"type": "markdown"}],
+        "parsers": [{"type": "pdf", "mode": "auto"}],
+        "onlyMainContent": False,
+    })
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as fc_client:
+            resp = await fc_client.post(
+                f"{settings.firecrawl_base_url}/v2/parse",
+                headers={"Authorization": f"Bearer {settings.firecrawl_api_key}"},
+                files=[
+                    ("file",    (filename, pdf_bytes, "application/pdf")),
+                    ("options", (None, parse_options, "application/json")),
+                ],
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning(f"[FC-PARSE] API call failed for {url}: {type(e).__name__}: {e}")
+        return ""
+
+    markdown = (data.get("data") or {}).get("markdown", "")
+    if markdown:
+        logger.info(f"[FC-PARSE] Got {len(markdown):,} chars of markdown for {url}")
+    else:
+        logger.warning(f"[FC-PARSE] No markdown in response for {url}. success={data.get('success')}")
+
+    return markdown
 
 
 async def fetch_page_async(url: str) -> dict:
@@ -399,44 +564,55 @@ async def fetch_pages_batch_async(urls: list[str], on_done=None) -> list[dict]:
 @tool
 def fetch_page(url: str) -> dict:
     """
-    Fetch a single web page. Tries httpx first, curl_cffi for TLS issues,
-    Playwright for JS-heavy pages. Returns html, text, status, metadata.
+    Fetch a single web page. Returns metadata only (url, status, success, content_length).
+    HTML is stored in internal cache and used automatically by run_extraction_pipeline.
     """
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
+        try:
+            loop = asyncio.get_event_loop()
+            is_running = loop.is_running()
+        except RuntimeError:
+            is_running = False
+        if is_running:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 future = pool.submit(asyncio.run, fetch_page_async(url))
-                return future.result(timeout=60)
+                result = future.result(timeout=60)
         else:
-            return loop.run_until_complete(fetch_page_async(url))
+            result = asyncio.run(fetch_page_async(url))
+        return _store_and_strip(result)
     except Exception as e:
         logger.error(f"fetch_page failed for {url}: {e}")
-        return _empty_result(url, str(e))
+        return _store_and_strip(_empty_result(url, str(e)))
 
 
 @tool
 def fetch_pages_batch(urls: list[str]) -> list[dict]:
     """
-    Fetch multiple pages concurrently. Rate-limited per domain.
-    Returns list of page results with html, text, status.
+    Fetch multiple pages concurrently. Returns metadata list only (url, status, success,
+    content_length, is_js_rendered). HTML is stored in internal cache and used automatically
+    by run_extraction_pipeline — do NOT pass html to other tools.
     """
     if not urls:
         return []
     urls = list(dict.fromkeys(urls))[:_settings.batch_size]
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
+        try:
+            loop = asyncio.get_event_loop()
+            is_running = loop.is_running()
+        except RuntimeError:
+            is_running = False
+        if is_running:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 future = pool.submit(asyncio.run, fetch_pages_batch_async(urls))
-                return future.result(timeout=300)
+                results = future.result(timeout=300)
         else:
-            return loop.run_until_complete(fetch_pages_batch_async(urls))
+            results = asyncio.run(fetch_pages_batch_async(urls))
+        return [_store_and_strip(r) for r in results]
     except Exception as e:
         logger.error(f"fetch_pages_batch failed: {e}")
-        return [_empty_result(u, str(e)) for u in urls]
+        return [_store_and_strip(_empty_result(u, str(e))) for u in urls]
 
 
 @tool

@@ -16,11 +16,17 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        env_ignore_empty=True,
     )
 
     openai_api_key: str = Field(default="", description="OpenAI API key")
-    openai_model: str = Field(default="gpt-4o-mini", description="OpenAI model for extraction fallback")
+    openai_model: str = Field(default="gpt-5-nano", description="OpenAI model for extraction fallback")
     openai_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+
+    jina_api_key: str = Field(default="", description="Jina AI Reader API key")
+    tavily_api_key: str = Field(default="", description="Tavily Search API key")
+    firecrawl_api_key: str = Field(default="", description="Firecrawl API key (fc-...)")
+    firecrawl_base_url: str = Field(default="https://api.firecrawl.dev", description="Firecrawl API base URL")
 
     max_concurrent_requests: int = Field(default=20, ge=1, le=100)
     max_depth: int = Field(default=3, ge=1, le=10)
@@ -47,6 +53,30 @@ class Settings(BaseSettings):
     proxy_enabled: bool = Field(default=False)
     proxy_list: list[str] = Field(default=[])
     proxy_rotate: bool = Field(default=True)
+
+    @field_validator("proxy_list", mode="before")
+    @classmethod
+    def parse_proxy_list(cls, v):
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            import json as _json
+            try:
+                parsed = _json.loads(v)
+                return parsed if isinstance(parsed, list) else [v]
+            except Exception:
+                return [x.strip() for x in v.split(",") if x.strip()]
+        return []
+
+    openserp_base_url: str = Field(default="http://localhost:7000")
+    openserp_enabled: bool = Field(default=True)
+
+    openhands_base_url: str = Field(default="http://localhost:3000")
+    openhands_parser_enabled: bool = Field(default=True)
+    openhands_parser_model: str = Field(default="gpt-4o-mini", description="Model khusus untuk generate parser code")
 
     min_vendor_fields: int = Field(default=3, description="Min fields for rule-based to be considered success")
     vendor_dedup_fields: list[str] = Field(default=["name", "website"])
@@ -89,7 +119,7 @@ class Settings(BaseSettings):
         return v
 
     MODELS_NO_TEMPERATURE: set[str] = {
-        "gpt-5-mini", "gpt-5-mini-2025-08-07",
+        "gpt-5-nano", "gpt-5-mini", "gpt-5-mini-2025-08-07",
         "gpt-5", "gpt-5-2025-06-05",
         "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini",
     }
@@ -100,7 +130,7 @@ class Settings(BaseSettings):
         valid_models = {
             "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo",
             "gpt-4o-2024-08-06", "gpt-4o-mini-2024-07-18",
-            "gpt-5-mini", "gpt-5-mini-2025-08-07",
+            "gpt-5-nano", "gpt-5-mini", "gpt-5-mini-2025-08-07",
             "gpt-5", "gpt-5-2025-06-05",
             "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini",
         }
@@ -139,6 +169,14 @@ class Settings(BaseSettings):
         return bool(self.openai_api_key and self.openai_api_key != "your_openai_api_key_here")
 
     @property
+    def has_jina_key(self) -> bool:
+        return bool(self.jina_api_key and self.jina_api_key not in ("", "your_jina_api_key_here"))
+
+    @property
+    def has_firecrawl_key(self) -> bool:
+        return bool(self.firecrawl_api_key and self.firecrawl_api_key not in ("", "your_firecrawl_api_key_here"))
+
+    @property
     def effective_llm_enabled(self) -> bool:
         return self.llm_fallback_enabled and self.has_openai_key
 
@@ -172,9 +210,9 @@ def setup_logging(settings: Settings) -> None:
     logger.add(
         sys.stderr,
         format=log_format,
-        level=settings.log_level,
+        level="INFO",
         colorize=True,
-        backtrace=True,
+        backtrace=False,
         diagnose=False,
     )
 

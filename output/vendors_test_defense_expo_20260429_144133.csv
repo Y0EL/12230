@@ -1,0 +1,6 @@
+﻿name,website,email,phone,address,city,country,category,description,linkedin,twitter,booth_number,event_name,event_location,event_date,source_url,extraction_method,confidence_score
+Test Corp 1,,,,,,Australia,,,,,A1,,,,https://test.pdf,pdf_rule_based,0.7
+Test Corp 2,,,,,,Australia,,,,,A2,,,,https://test.pdf,pdf_rule_based,0.7
+Test Corp 3,,,,,,Australia,,,,,A3,,,,https://test.pdf,pdf_rule_based,0.7
+Test Corp 4,,,,,,Australia,,,,,A4,,,,https://test.pdf,pdf_rule_based,0.7
+Test Corp 5,,,,,,Australia,,,,,A5,,,,https://test.pdf,pdf_rule_based,0.7

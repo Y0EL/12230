@@ -291,8 +291,11 @@ python run.py "security conference 2026" --no-llm
 
 # Verbose untuk debugging
 python run.py "expo 2026" --verbose
-```
 
+# Jalanin docker
+docker run -p 127.0.0.1:7000:7000 -it karust/openserp serve -a 0.0.0.0 -p 7000
+
+```
 
 ### Flag CLI lengkap
 

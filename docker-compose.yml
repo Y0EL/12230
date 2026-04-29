@@ -1,0 +1,18 @@
+services:
+  openhands:
+    image: docker.openhands.dev/openhands/openhands:1.6
+    container_name: openhands-app
+    pull_policy: always
+    stdin_open: true
+    tty: true
+    environment:
+      - AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server
+      - AGENT_SERVER_IMAGE_TAG=1.15.0-python
+      - LOG_ALL_EVENTS=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.openhands:/.openhands
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - host.docker.internal:host-gateway
