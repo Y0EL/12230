@@ -213,7 +213,7 @@ LANGKAH 2 — EKSTRAK SEMUA DARI HALAMAN LISTING:
   b. LANGSUNG panggil SATU KALI (JANGAN loop run_extraction_pipeline!):
        extract_all_vendor_profiles(
            vendor_urls=[...semua URL dari langkah a...],
-           event_context='{"event_name":"..."}',
+           event_context='{{"event_name":"..."}}',
            max_concurrent=8
        )
      Tool ini:
@@ -604,22 +604,39 @@ async def crawl_urls_parallel(
     )
 
     async def _run_one(url: str, worker_id: int) -> dict:
-        async with sem:
-            worker = _URLWorkerAgent(url, ctx, session_id, worker_id,
-                                     max_per_worker=max_per_worker)
-            try:
-                return await asyncio.wait_for(
-                    worker.run(), timeout=_WORKER_TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                return {
-                    "url": url,
-                    "domain": _domain_of(url),
-                    "status": "timeout",
-                    "vendors_found": 0,
-                    "pages_crawled": 0,
-                    "elapsed": _WORKER_TIMEOUT_SECONDS,
-                }
+        domain = _domain_of(url)
+        try:
+            async with sem:
+                worker = _URLWorkerAgent(url, ctx, session_id, worker_id,
+                                         max_per_worker=max_per_worker)
+                try:
+                    return await asyncio.wait_for(
+                        worker.run(), timeout=_WORKER_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    return {
+                        "url": url,
+                        "domain": domain,
+                        "status": "timeout",
+                        "vendors_found": 0,
+                        "pages_crawled": 0,
+                        "elapsed": _WORKER_TIMEOUT_SECONDS,
+                    }
+        except Exception as exc:
+            import traceback as _tb
+            logger.warning(
+                f"[W{worker_id:02d}] {domain} — FATAL init/run error: {exc}\n"
+                + _tb.format_exc()
+            )
+            return {
+                "url": url,
+                "domain": domain,
+                "status": "error",
+                "vendors_found": 0,
+                "pages_crawled": 0,
+                "elapsed": 0.0,
+                "error": str(exc),
+            }
 
     tasks = [_run_one(url, i) for i, url in enumerate(urls)]
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -628,10 +645,19 @@ async def crawl_urls_parallel(
     worker_results: list[dict] = []
     completed = failed = timeout_count = total_pages = 0
 
-    for res in raw_results:
+    for i, res in enumerate(raw_results):
         if isinstance(res, Exception):
             failed += 1
-            worker_results.append({"status": "error", "error": str(res)})
+            err_url = urls[i] if i < len(urls) else "?"
+            logger.warning(f"[POOL] Worker {i} ({_domain_of(err_url)}) unhandled exception: {res}")
+            worker_results.append({
+                "url": err_url,
+                "domain": _domain_of(err_url),
+                "status": "error",
+                "vendors_found": 0,
+                "elapsed": 0.0,
+                "error": str(res),
+            })
         else:
             r = res
             worker_results.append(r)
