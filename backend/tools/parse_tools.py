@@ -292,7 +292,7 @@ def _find_pagination_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
     if "page" in query_params:
         try:
             current_page = int(query_params["page"][0])
-            for offset in range(1, 6):
+            for offset in range(1, 51):
                 new_params = {**query_params, "page": [str(current_page + offset)]}
                 new_query = urlencode(new_params, doseq=True)
                 new_url = urlunparse(parsed._replace(query=new_query))
@@ -522,6 +522,167 @@ def find_exhibitor_list_pages(links: list[dict], base_url: str) -> list[dict]:
     return deduped[:100]
 
 
+@tool
+def detect_next_button(html: str, base_url: str) -> dict:
+    """
+    Detect DOM-based 'Next' / 'Load More' pagination that doesn't change the URL.
+    Returns the next page URL if found via href, or signals that a click is needed.
+
+    Use this when extract_page_metadata finds no pagination URLs but the page
+    likely has more content (e.g. event platforms with JS pagination).
+    """
+    if not html:
+        return {"next_url": "", "needs_click": False, "selector": ""}
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    # Patterns that indicate a "next page" element
+    NEXT_TEXT = re.compile(r"\bnext\b|\bselanjutnya\b|\b>\b|\b›\b|\b»\b|\bnext page\b", re.I)
+    NEXT_CLASS = re.compile(r"next|forward|arrow-right|pagination-next|page-next", re.I)
+    NEXT_ARIA  = re.compile(r"next page|next", re.I)
+
+    # 1. Try <a> tags with "next" text or class
+    for a in soup.find_all("a", href=True):
+        text  = a.get_text(strip=True)
+        cls   = " ".join(a.get("class", []))
+        aria  = a.get("aria-label", "")
+        rel   = a.get("rel", [])
+        if (NEXT_TEXT.search(text) or NEXT_CLASS.search(cls) or
+                NEXT_ARIA.search(aria) or "next" in rel):
+            href = _normalize_url(a["href"], base_url)
+            if href and href != base_url:
+                return {"next_url": href, "needs_click": False, "selector": ""}
+
+    # 2. Try <button> or <li> that would need a JS click
+    for elem in soup.find_all(["button", "li", "span", "div"]):
+        text = elem.get_text(strip=True)
+        cls  = " ".join(elem.get("class", []))
+        if NEXT_TEXT.search(text) or NEXT_CLASS.search(cls):
+            # Build a CSS selector so the crawler can click it
+            elem_id = elem.get("id", "")
+            if elem_id:
+                selector = f"#{elem_id}"
+            elif elem.get("class"):
+                selector = "." + ".".join(elem["class"])
+            else:
+                selector = elem.name
+            return {"next_url": "", "needs_click": True, "selector": selector}
+
+    return {"next_url": "", "needs_click": False, "selector": ""}
+
+
+@tool
+def intercept_api_vendors(url: str) -> list[dict]:
+    """
+    Use Playwright to load the page while intercepting XHR / fetch API calls.
+    Captures JSON responses that look like vendor/exhibitor lists from:
+      - /api/exhibitors, /api/vendors, /api/companies, /graphql, etc.
+
+    Returns a flat list of raw vendor dicts extracted from intercepted responses.
+    Use this for SPA event platforms (Swapcard, EventsAir, Stova, etc.) where
+    vendor data is loaded dynamically — not present in the initial HTML.
+    """
+    import asyncio
+    import json as _json
+
+    _VENDOR_API_PATTERNS = re.compile(
+        r"exhibitor|vendor|company|companies|sponsor|participant|booth|stand|brand",
+        re.I,
+    )
+    _NAME_KEYS = {"name", "companyName", "company_name", "title", "displayName",
+                  "exhibitorName", "vendorName", "organizationName"}
+    _VENDOR_FIELDS = {"name", "website", "url", "email", "phone", "country",
+                      "city", "category", "description", "booth", "stand",
+                      "linkedin", "twitter", "logo", "industry"}
+
+    captured_vendors: list[dict] = []
+
+    async def _run():
+        from playwright.async_api import async_playwright
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+            )
+
+            async def handle_response(response):
+                try:
+                    req_url = response.url
+                    # Only intercept likely vendor API endpoints
+                    if not _VENDOR_API_PATTERNS.search(req_url):
+                        return
+                    ct = response.headers.get("content-type", "")
+                    if "json" not in ct:
+                        return
+                    if response.status not in range(200, 300):
+                        return
+                    body = await response.json()
+
+                    # Walk JSON to find arrays of objects with vendor-like keys
+                    def _extract_from_json(obj, depth=0):
+                        if depth > 5:
+                            return
+                        if isinstance(obj, list):
+                            for item in obj:
+                                if isinstance(item, dict):
+                                    keys = set(item.keys())
+                                    if _NAME_KEYS & keys:
+                                        # Looks like a vendor record
+                                        vendor = {}
+                                        for k, v in item.items():
+                                            norm_key = k.lower().replace("-", "_")
+                                            if norm_key in _VENDOR_FIELDS or any(
+                                                f in norm_key for f in _VENDOR_FIELDS
+                                            ):
+                                                vendor[norm_key] = str(v)[:500] if v else ""
+                                        if vendor.get("name"):
+                                            captured_vendors.append(vendor)
+                                    else:
+                                        _extract_from_json(item, depth + 1)
+                        elif isinstance(obj, dict):
+                            for v in obj.values():
+                                _extract_from_json(v, depth + 1)
+
+                    _extract_from_json(body)
+                except Exception:
+                    pass
+
+            page = await context.new_page()
+            page.on("response", handle_response)
+
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    await asyncio.sleep(3)
+                except Exception:
+                    pass
+
+            await browser.close()
+
+    try:
+        asyncio.run(_run())
+    except RuntimeError:
+        # Already in an event loop (shouldn't happen in tool context, but guard anyway)
+        pass
+
+    logger.info(f"[API-INTERCEPT] {len(captured_vendors)} vendors captured from {url}")
+    return captured_vendors[:500]
+
+
 ALL_PARSE_TOOLS = [
     extract_links,
     classify_exhibitor_links,
@@ -529,4 +690,6 @@ ALL_PARSE_TOOLS = [
     extract_vendor_domain_links,
     score_page_as_event,
     find_exhibitor_list_pages,
+    detect_next_button,
+    intercept_api_vendors,
 ]

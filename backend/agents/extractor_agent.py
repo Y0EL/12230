@@ -88,7 +88,7 @@ class ExtractorAgent(BaseAgent):
                     stats.extraction_failed += 1
                     continue
 
-                if vendor.get("confidence_score", 0) < 0.25:
+                if vendor.get("confidence_score", 0) < 0.10:
                     logger.debug(f"[ExtractorAgent] low confidence ({vendor.get('confidence_score', 0):.2f}) skipped: {url}")
                     failed_count += 1
                     stats.extraction_failed += 1

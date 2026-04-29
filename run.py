@@ -106,12 +106,16 @@ def validate_environment(settings, args) -> bool:
     openserp_ok = False
     try:
         import httpx
-        resp = httpx.get(
-            f"{settings.openserp_base_url}/google/search",
-            params={"text": "test", "limit": 1},
-            timeout=5,
-        )
-        openserp_ok = resp.status_code == 200
+        # Ping root endpoint saja — tidak nge-Google beneran (cepat, tidak timeout)
+        for _path in ("/", "/health", "/google/search"):
+            try:
+                _params = {"text": "ping", "limit": 1} if "search" in _path else {}
+                resp = httpx.get(f"{settings.openserp_base_url}{_path}",
+                                 params=_params, timeout=3)
+                openserp_ok = True
+                break
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -124,8 +128,9 @@ def validate_environment(settings, args) -> bool:
     else:
         print_warning(
             "ENV",
-            "Tidak ada search engine. Set TAVILY_API_KEY di .env, atau jalankan OpenSERP:\n"
-            "    docker run -p 127.0.0.1:7000:7000 -it karust/openserp serve -a 0.0.0.0 -p 7000"
+            "Tidak ada search engine aktif. Crawler akan pakai DuckDuckGo (lambat).\n"
+            "  Untuk hasil maksimal jalankan OpenSERP: start_openserp.bat\n"
+            "  Download binary: https://github.com/karust/openserp/releases"
         )
 
     try:
@@ -197,7 +202,8 @@ def main() -> int:
     elapsed = time.time() - start_time
     vendor_count = len(result.get("vendors", []))
     excel_path = result.get("output_excel", "")
-    csv_path = result.get("output_csv", "")
+    csv_path   = result.get("output_csv", "")
+    json_path  = result.get("output_json", "")
 
     print_separator()
 
@@ -207,9 +213,11 @@ def main() -> int:
 
     console.print(f"\n[bold green]Done![/bold green]  {vendor_count} vendors in {elapsed:.1f}s\n")
     if excel_path:
-        console.print(f"  Excel: [bold cyan]{excel_path}[/bold cyan]")
+        console.print(f"  Excel : [bold cyan]{excel_path}[/bold cyan]")
     if csv_path:
-        console.print(f"  CSV:   [bold cyan]{csv_path}[/bold cyan]")
+        console.print(f"  CSV   : [bold cyan]{csv_path}[/bold cyan]")
+    if json_path:
+        console.print(f"  JSON  : [bold cyan]{json_path}[/bold cyan]")
     console.print()
 
     return 0

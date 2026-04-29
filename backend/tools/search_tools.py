@@ -20,6 +20,7 @@ _settings = get_settings()
 _ENGINE_TIMEOUT: dict[str, int] = {
     "google":     45,
     "baidu":      90,
+    "yandex":     90,
     "bing":       45,
     "duckduckgo": 45,
 }
@@ -106,8 +107,8 @@ REGION_MAP = [
     },
     {
         "keywords": ["russia", "rusia", "russian", "moskow", "moscow", "st. petersburg"],
-        "engine": "google",
-        "extra_params": {"gl": "ru", "hl": "ru"},
+        "engine": "yandex",
+        "extra_params": {},
         "label": "Russia",
     },
     {
@@ -165,67 +166,41 @@ GLOBAL_KEYWORDS = [
 _GLOBAL_REGION: dict = {"engine": "google", "extra_params": {}, "label": "Global"}
 
 _openserp_available: Optional[bool] = None
-_tavily_available: Optional[bool] = None
-
-
-def _check_tavily() -> bool:
-    global _tavily_available
-    if _tavily_available is not None:
-        return _tavily_available
-    key = _settings.tavily_api_key
-    if not key:
-        _tavily_available = False
-        return False
-    _tavily_available = True
-    return True
-
-
-def _tavily_search(query: str, max_results: int = 10) -> list[dict]:
-    """Search via Tavily API. Returns list of {url, title, snippet}."""
-    key = _settings.tavily_api_key
-    if not key:
-        return []
-    body = {
-        "api_key":      key,
-        "query":        query,
-        "max_results":  max_results,
-        "search_depth": "basic",
-        "include_answer":      False,
-        "include_raw_content": False,
-    }
-    try:
-        resp = httpx.post("https://api.tavily.com/search", json=body, timeout=30)
-        if resp.status_code == 200:
-            items = resp.json().get("results", [])
-            return [
-                {
-                    "url":     r.get("url", ""),
-                    "title":   r.get("title", ""),
-                    "snippet": r.get("content", "")[:300],
-                }
-                for r in items if r.get("url")
-            ]
-        logger.warning(f"[TAVILY] HTTP {resp.status_code} for query: {query[:50]}")
-    except Exception as e:
-        logger.warning(f"[TAVILY] Error: {e}")
-    return []
 
 
 def _check_openserp() -> bool:
+    """
+    Cek apakah OpenSERP server nyala dengan ping root endpoint.
+    Tidak melakukan real search — hanya cek konektivitas.
+    Cache hasil per proses; di-reset oleh clear_openserp_cache() tiap run baru.
+    """
     global _openserp_available
     if _openserp_available is not None:
         return _openserp_available
-    base = _settings.openserp_base_url
-    try:
-        resp = httpx.get(
-            f"{base}/google/search",
-            params={"text": "test", "limit": 1},
-            timeout=10,
-        )
-        _openserp_available = resp.status_code == 200
-    except Exception:
+    if not _settings.openserp_enabled:
         _openserp_available = False
-    return _openserp_available
+        return False
+    base = _settings.openserp_base_url
+    # Coba beberapa endpoint ringan — root atau health check
+    for path in ("/", "/health", "/google/search"):
+        try:
+            params = {"text": "ping", "limit": 1} if "search" in path else {}
+            resp = httpx.get(f"{base}{path}", params=params, timeout=4)
+            # Server nyala = status apapun selain connection error
+            _openserp_available = True
+            logger.debug(f"[OPENSERP] Tersedia di {base} (via {path}, status={resp.status_code})")
+            return True
+        except Exception:
+            continue
+    _openserp_available = False
+    logger.debug(f"[OPENSERP] Tidak dapat dijangkau di {base}")
+    return False
+
+
+def clear_openserp_cache() -> None:
+    """Reset cache availability check — dipanggil tiap run baru."""
+    global _openserp_available
+    _openserp_available = None
 
 
 def _openserp_search(
@@ -380,29 +355,43 @@ def _search_region(
     return results
 
 
-def _search_with_tavily_fallback(query: str, max_seeds: int = 40) -> list[dict]:
-    """
-    Search using Tavily across multiple query variants.
-    Used when OpenSERP is unavailable.
-    """
-    templates_used = SEARCH_TEMPLATES[:6]
+def _ddg_search(query: str, max_results: int = 20) -> list[dict]:
+    """DuckDuckGo search via ddgs library — no API key, used as fallback."""
+    try:
+        from ddgs import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        return [
+            {
+                "url":     r.get("href", ""),
+                "title":   r.get("title", ""),
+                "snippet": r.get("body", "")[:300],
+            }
+            for r in results if r.get("href")
+        ]
+    except Exception as e:
+        logger.warning(f"[DDG] Error: {e}")
+        return []
+
+
+def _search_with_ddg_fallback(query: str, max_seeds: int = 40) -> list[dict]:
+    """DDG fallback when OpenSERP is down. No API key needed."""
     core = _extract_core_query(query)
     all_results: list[dict] = []
-
-    for template in templates_used:
+    for template in SEARCH_TEMPLATES[:6]:
         search_q = template.format(query=core)
-        raw = _tavily_search(search_q, max_results=10)
+        raw = _ddg_search(search_q, max_results=15)
         for r in raw:
             r["score"] = _score_seed_url(r["url"], r.get("title", ""), r.get("snippet", ""))
             r["domain"] = urlparse(r["url"]).netloc.lower()
-            r["region_label"] = "Global (Tavily)"
-            r["region_engine"] = "tavily"
+            r["region_label"] = "Global (DDG)"
+            r["region_engine"] = "duckduckgo"
         all_results.extend(raw)
-        time.sleep(0.5)
+        time.sleep(random.uniform(0.8, 1.5))
 
     all_results = _deduplicate_urls(all_results)
     all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-    logger.info(f"[TAVILY] {len(all_results)} seed URLs dari {len(templates_used)} queries")
+    logger.info(f"[DDG] {len(all_results)} seed URLs (fallback mode)")
     return all_results[:max_seeds]
 
 
@@ -417,17 +406,12 @@ def search_exhibitor_events(query: str, max_seeds: int = 40) -> list[dict]:
     core = _extract_core_query(query)
     query_en = core
 
-    # ── Tavily primary — OpenSERP supplementary ──────────────────────────────
-    if _check_tavily():
-        logger.info("[SEARCH] Menggunakan Tavily sebagai search engine utama")
-        tavily_results = _search_with_tavily_fallback(query, max_seeds)
-        if tavily_results:
-            return tavily_results
-        logger.info("[SEARCH] Tavily 0 hasil — fallback ke OpenSERP")
-
+    # ── OpenSERP primary — DDG fallback (no API key needed for either) ────────
     if not _check_openserp():
-        logger.error("Tidak ada search engine tersedia (Tavily kosong, OpenSERP down)")
-        return []
+        logger.warning("[SEARCH] OpenSERP tidak tersedia — fallback ke DuckDuckGo")
+        return _search_with_ddg_fallback(query, max_seeds)
+
+    logger.info("[SEARCH] OpenSERP aktif — multi-region mode")
 
     regions = _detect_regions(query)
 
@@ -505,13 +489,13 @@ def search_vendor_directory(
 
     all_results: list[dict] = []
 
-    use_tavily = _check_tavily()  # Tavily primary, OpenSERP supplementary
+    use_openserp = _check_openserp()
 
     for sq in search_queries[:3]:
-        if use_tavily:
-            results = _tavily_search(sq, max_results=10)
-        else:
+        if use_openserp:
             results = _openserp_search("google", sq, limit=20)
+        else:
+            results = _ddg_search(sq, max_results=15)
         for r in results:
             r["score"] = _score_seed_url(r["url"], r.get("title", ""), r.get("snippet", ""))
             r["domain"] = urlparse(r["url"]).netloc.lower()

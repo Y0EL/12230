@@ -101,7 +101,7 @@ class CrawlerAgent(BaseAgent):
         batch_num = 0
         start_time = time.time()
 
-        while not queue.is_empty() and total_crawled < self._settings.batch_size * 3:
+        while not queue.is_empty() and total_crawled < self._settings.batch_size * 10:
             batch = queue.pop_batch(min(batch_size, 100))
             if not batch:
                 break
@@ -221,13 +221,13 @@ class CrawlerAgent(BaseAgent):
                     except Exception as e:
                         logger.debug(f"find_exhibitor_list_pages failed: {e}")
 
-                for link in exhibitor_links[:50]:
+                for link in exhibitor_links[:200]:
                     link_url = link.get("url", "")
                     link_depth = current_depth + 1
                     link_score = link.get("score", 0)
-                    link_priority = min(link_score, 10)
+                    link_priority = min(max(link_score, 1), 10)
 
-                    if link_score >= 3:
+                    if link_score >= 1:
                         all_vendor_pages.append({
                             "url": link_url,
                             "score": link_score,
@@ -237,7 +237,7 @@ class CrawlerAgent(BaseAgent):
                         })
                         new_vendor_pages += 1
 
-                    if link_depth <= max_depth and link_score >= 2:
+                    if link_depth <= max_depth and link_score >= 0:
                         if queue.add(link_url, depth=link_depth, source=final_url, priority=link_priority):
                             new_links_added += 1
 

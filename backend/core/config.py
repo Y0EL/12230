@@ -54,6 +54,15 @@ class Settings(BaseSettings):
     proxy_list: list[str] = Field(default=[])
     proxy_rotate: bool = Field(default=True)
 
+    # Stealth / camouflage settings
+    stealth_enabled: bool = Field(default=True, description="Enable playwright-stealth + browserforge fingerprinting")
+    sticky_proxy_per_domain: bool = Field(default=True, description="Reuse same proxy for same domain within a session")
+    scroll_to_bottom_enabled: bool = Field(default=True, description="Simulate infinite scroll in Playwright")
+    scroll_steps: int = Field(default=5, ge=1, le=20, description="Number of scroll steps per page")
+
+    # OpenAI web search enrichment
+    openai_websearch_enrichment: bool = Field(default=True, description="Use OpenAI Responses API web_search to enrich missing vendor fields")
+
     @field_validator("proxy_list", mode="before")
     @classmethod
     def parse_proxy_list(cls, v):

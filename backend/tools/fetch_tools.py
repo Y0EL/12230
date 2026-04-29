@@ -35,6 +35,15 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from backend.core.config import get_settings
+from backend.tools.stealth_tools import (
+    apply_stealth,
+    get_cookies,
+    get_realistic_headers,
+    get_sticky_proxy,
+    random_chrome_version,
+    save_cookies,
+    scroll_to_bottom,
+)
 
 _ua = UserAgent(fallback="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
 _settings = get_settings()
@@ -90,32 +99,22 @@ def _get_domain_semaphore(domain: str) -> asyncio.Semaphore:
         key = f"_crawler_domain_{domain}"
         existing = getattr(loop, key, None)
         if existing is None:
-            existing = asyncio.Semaphore(2)
+            existing = asyncio.Semaphore(5)
             setattr(loop, key, existing)
         return existing
     except RuntimeError:
-        return asyncio.Semaphore(2)
+        return asyncio.Semaphore(5)
 
 
 def _random_headers(url: str = "") -> dict[str, str]:
-    ua_string = _ua.random
+    headers = get_realistic_headers(url)
+    # Always ensure User-Agent is set; browserforge may omit it
+    if "User-Agent" not in headers and "user-agent" not in headers:
+        headers["User-Agent"] = _ua.random
     parsed = urlparse(url)
-    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else ""
-    headers = {
-        "User-Agent": ua_string,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Cache-Control": "max-age=0",
-    }
-    if origin:
-        headers["Origin"] = origin
-        headers["Referer"] = origin + "/"
+    if parsed.netloc:
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        headers.setdefault("Referer", origin + "/")
     return headers
 
 
@@ -232,9 +231,12 @@ async def _fetch_with_curl_cffi(url: str) -> dict:
         delay = random.uniform(_settings.request_delay_min, _settings.request_delay_max)
         await asyncio.sleep(delay)
         from backend.utils.proxy import get_proxy_rotator
-        proxy = get_proxy_rotator().next()
+        rotator = get_proxy_rotator()
+        domain = urlparse(url).netloc
+        proxy = get_sticky_proxy(domain, rotator) if _settings.sticky_proxy_per_domain else rotator.next()
         proxy_dict = {"http": proxy, "https": proxy} if proxy else None
-        async with AsyncSession(impersonate="chrome120") as session:
+        chrome_ver = random_chrome_version()
+        async with AsyncSession(impersonate=chrome_ver) as session:
             response = await session.get(
                 url,
                 headers=_random_headers(url),
@@ -288,15 +290,24 @@ async def _get_loop_browser():
 
 async def _fetch_with_playwright(url: str) -> dict:
     start = time.time()
+    domain = urlparse(url).netloc
     try:
         browser = await _get_loop_browser()
         from backend.utils.proxy import get_proxy_rotator
-        proxy = get_proxy_rotator().next()
+        rotator = get_proxy_rotator()
+        proxy = get_sticky_proxy(domain, rotator) if _settings.sticky_proxy_per_domain else rotator.next()
+
+        from backend.tools.stealth_tools import get_fingerprint
+        fp = get_fingerprint() or {}
+        fp_ua = (fp.get("navigator", {}) or {}).get("userAgent", "") if isinstance(fp.get("navigator"), dict) else ""
+
         context_kwargs: dict = {
-            "viewport": {"width": 1280, "height": 800},
-            "user_agent": _ua.random,
+            "viewport": {"width": random.choice([1280, 1366, 1440, 1920]),
+                         "height": random.choice([720, 768, 800, 900, 1080])},
+            "user_agent": fp_ua or _ua.random,
             "java_script_enabled": True,
             "accept_downloads": False,
+            "locale": "en-US",
         }
         if proxy:
             parsed_proxy = urlparse(proxy)
@@ -306,23 +317,43 @@ async def _fetch_with_playwright(url: str) -> dict:
             if parsed_proxy.password:
                 pw_proxy["password"] = parsed_proxy.password
             context_kwargs["proxy"] = pw_proxy
+
         context = await browser.new_context(**context_kwargs)
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = {runtime: {}};
-        """)
+
+        # Restore cookies from previous session for this domain
+        saved_cookies = get_cookies(domain)
+        if saved_cookies:
+            try:
+                await context.add_cookies(saved_cookies)
+            except Exception:
+                pass
 
         page = await context.new_page()
         page.set_default_timeout(_settings.playwright_timeout)
 
+        # Apply full stealth patch (playwright-stealth + fallback JS)
+        await apply_stealth(page)
+
         await asyncio.sleep(random.uniform(0.5, 1.5))
         try:
             response = await page.goto(url, wait_until="domcontentloaded")
-            # "load" jauh lebih cepat dari "networkidle" — tidak perlu tunggu analytics/ads selesai
             await page.wait_for_load_state("load", timeout=_settings.playwright_timeout)
+
+            # Infinite scroll simulation: scroll down to trigger lazy-loaded content
+            if _settings.scroll_to_bottom_enabled:
+                await scroll_to_bottom(page, steps=_settings.scroll_steps)
+
             html = await page.content()
             status = response.status if response else 200
             elapsed = time.time() - start
+
+            # Persist cookies for this domain
+            try:
+                cookies = await context.cookies()
+                save_cookies(domain, cookies)
+            except Exception:
+                pass
+
             await context.close()
             return _success_result(url, html, status, elapsed, "text/html", url, is_js_rendered=True)
         except Exception as e:

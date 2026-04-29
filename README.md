@@ -259,43 +259,113 @@ memanggil API OpenAI untuk menyertakan atau tidak menyertakan parameter temperat
 ## Cara Menjalankan
 
 
-### Setup pertama kali
+### Opsi Cepat: Pakai File BAT (Rekomendasi)
 
-```bash
+Tiga file `.bat` sudah tersedia di root folder. Cukup double-click atau jalankan di terminal:
+
+| File | Fungsi |
+|------|--------|
+| `setup.bat` | Setup pertama kali: buat venv, install semua dependency, install Playwright |
+| `start_openserp.bat` | Jalankan OpenSERP search engine di background (port 7000) |
+| `run.bat` | Jalankan crawler — tinggal isi query saat diminta |
+
+**Urutan yang benar pertama kali:**
+```
+1. Double-click setup.bat          ← tunggu sampai selesai
+2. Isi .env dengan OPENAI_API_KEY  ← wajib
+3. Double-click start_openserp.bat ← biarkan terminal ini terbuka
+4. Double-click run.bat            ← di terminal baru
+```
+
+
+---
+
+
+### Setup Manual (tanpa BAT)
+
+
+#### 1. Install Python dependencies
+
+```cmd
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 playwright install chromium
-cp .env.example .env
-# edit .env, isi OPENAI_API_KEY
 ```
 
 
-### Perintah run
+#### 2. Konfigurasi .env
 
-```bash
-# Run standar
+```cmd
+copy .env.example .env
+```
+
+Buka `.env` lalu isi minimal:
+
+```
+OPENAI_API_KEY=sk-...         ← wajib untuk LLM extraction & enrichment
+OPENAI_MODEL=gpt-4o-mini      ← model yang digunakan
+OPENSERP_BASE_URL=http://localhost:7000
+OPENSERP_ENABLED=true
+```
+
+
+#### 3. Setup OpenSERP (tanpa Docker)
+
+OpenSERP adalah search engine lokal yang digunakan sebagai sumber utama pencarian.
+Tidak perlu Docker — cukup download binary-nya:
+
+1. Download file berikut:
+   ```
+   https://github.com/karust/openserp/releases/download/v0.7.2/openserp-windows-amd64-0.7.2.tgz
+   ```
+
+2. Extract ke folder `C:\openserp\` (atau folder mana saja)
+
+3. Jalankan di terminal tersendiri (biarkan terbuka):
+   ```cmd
+   C:\openserp\openserp.exe serve -a 0.0.0.0 -p 7000
+   ```
+
+4. Verifikasi berjalan — buka browser ke `http://localhost:7000` harus tampil halaman OpenSERP
+
+> OpenSERP harus tetap berjalan selama crawler dipakai. Gunakan `start_openserp.bat`
+> supaya tidak perlu mengetik path setiap kali.
+
+
+#### 4. Jalankan crawler
+
+```cmd
+venv\Scripts\activate
+python run.py "cyber defense exhibition 2026"
+```
+
+
+---
+
+
+### Contoh Perintah
+
+```cmd
+REM Run standar
 python run.py "cyber defense exhibition 2026"
 
-# Multi region (aktif karena kata "global")
+REM Multi region (aktif karena kata "global")
 python run.py "cyber defense exhibition global 2026"
 
-# Region spesifik lewat keyword dalam query
+REM Region spesifik lewat keyword dalam query
 python run.py "cybersecurity expo China USA Oceania 2026"
 
-# Testing cepat: 10 vendor, tanpa enrichment
-python run.py "defense expo 2026" --max 10 --no-enrich
+REM Testing cepat: 50 vendor, tanpa enrichment
+python run.py "defense expo 2026" --max 50 --no-enrich
 
-# Tanpa LLM sama sekali
+REM Tanpa LLM sama sekali (hanya schema.org + rule-based)
 python run.py "security conference 2026" --no-llm
 
-# Verbose untuk debugging
+REM Verbose untuk debugging
 python run.py "expo 2026" --verbose
-
-# Jalanin docker
-docker run -p 127.0.0.1:7000:7000 -it karust/openserp serve -a 0.0.0.0 -p 7000
-
 ```
+
 
 ### Flag CLI lengkap
 
@@ -311,8 +381,10 @@ query              Wajib. Teks bebas. Region dideteksi otomatis dari keyword.
 ```
 
 PENTING: flag harus di luar tanda kutip query.
-Benar: `python run.py "cyber defense 2026" --max 10`
-Salah: `python run.py "cyber defense 2026 --max 10"`
+```
+Benar : python run.py "cyber defense 2026" --max 10
+Salah : python run.py "cyber defense 2026 --max 10"
+```
 
 
 ---
@@ -513,3 +585,178 @@ loguru                         Logging modern dengan format berwarna
 rich                           Terminal output yang kaya: progress bar, tabel, panel
 python-dotenv                  Load .env ke environment variables
 ```
+
+
+---
+
+
+## Perbandingan Arsitektur: LLM-Agent Crawler vs BeautifulSoup4 Crawler
+
+
+### Ringkasan Cepat
+
+| Dimensi | BeautifulSoup4 (BS4) | LLM-Agent (Proyek Ini) |
+|---|---|---|
+| **Paradigma** | Rule-based, deterministic | Autonomous agent, probabilistic |
+| **JavaScript** | ❌ Tidak support (butuh Selenium/Playwright manual) | ✅ Native via Playwright terintegrasi |
+| **Multi-bahasa** | ❌ Perlu hardcode per bahasa | ✅ Otomatis (LLM paham 50+ bahasa) |
+| **Navigasi cerdas** | ❌ URL harus benar dari awal | ✅ Worker mencari halaman exhibitor sendiri jika URL salah |
+| **Perubahan struktur HTML** | ❌ Rusak, harus update selector manual | ✅ Adaptif — LLM baca konten, bukan selector |
+| **Kualitas ekstraksi** | ⚠️ Sebatas yang ter-tag di HTML | ✅ Kontekstual — paham "ini vendor" vs "ini menu navigasi" |
+| **Pagination otomatis** | ⚠️ Harus hardcode pattern per site | ✅ detect_next_button + scroll loop + API interception |
+| **Kecepatan** | ✅ Sangat cepat (pure HTTP + regex) | ⚠️ Lebih lambat karena LLM latency |
+| **Biaya operasional** | ✅ Nyaris gratis (no API cost) | ⚠️ Ada biaya LLM per token |
+| **Maintenance** | ❌ Tinggi — setiap site ganti layout = update kode | ✅ Rendah — tidak ada selector yang perlu di-update |
+| **Skalabilitas** | ✅ Mudah horizontal scale (no state) | ✅ Paralel via asyncio worker pool |
+| **Determinisme** | ✅ Output selalu sama untuk input sama | ⚠️ Non-deterministic, hasil bisa sedikit bervariasi |
+| **Debugging** | ✅ Mudah — trace step by step | ⚠️ LLM reasoning sulit di-trace |
+| **Setup awal** | ✅ Cepat, 50-100 baris kode | ❌ Lebih kompleks, multi-file, butuh API key |
+| **Fallback saat gagal** | ❌ Error langsung, tidak ada recovery | ✅ Worker retry + partial export jika crash |
+| **Klasifikasi konten** | ❌ Tidak ada — semua teks di-scrape | ✅ LLM filter: vendor vs menu vs iklan vs berita |
+
+
+---
+
+
+### Detail Per Dimensi
+
+
+#### 1. Penanganan JavaScript & Dynamic Content
+
+**BS4:**
+```
+httpx.get(url) → BeautifulSoup(html) → soup.find_all("div.exhibitor")
+```
+Hanya membaca HTML statis. Konten yang di-render JavaScript (React, Vue, Angular, lazy-load)
+tidak terlihat. Solusi workaround biasanya menambahkan Selenium atau Playwright secara manual,
+tapi itu artinya menulis dua sistem paralel.
+
+**LLM-Agent:**
+```
+fetch_page(url) → Playwright headless → tunggu networkidle → ambil rendered HTML
+→ LLM baca konten → ekstrak vendor
+```
+Playwright sudah terintegrasi di fetch_page. Worker agent otomatis pakai Playwright untuk site
+yang terdeteksi JS-heavy (ciri: sedikit konten di raw HTML, banyak `<script>`).
+
+
+#### 2. Penanganan Multi-Bahasa
+
+**BS4:**
+```python
+# Harus hardcode per bahasa
+if lang == "zh":
+    name = soup.find("span", class_="company-name-cn").text
+elif lang == "ru":
+    name = soup.find("div", class_="company-title").text
+```
+Setiap bahasa baru = kode baru. Karakter CJK dan Cyrillic sering muncul garbled jika encoding
+salah.
+
+**LLM-Agent:**
+LLM secara native membaca Mandarin, Rusia, Arab, Korea tanpa konfigurasi khusus. Ditambah
+`deep-translator` untuk normalisasi nama ke Inggris sebelum validasi. Deteksi bahasa via
+`_detect_lang()` dengan fallback CJK/Cyrillic character counting jika tag `<html lang="">` absen.
+
+
+#### 3. Adaptasi terhadap Perubahan Layout Website
+
+**BS4:**
+```python
+# Site ganti class dari "exhibitor-card" ke "vendor-tile" → semua break
+vendors = soup.find_all("div", class_="exhibitor-card")  # ← error besok
+```
+Satu perubahan CSS class = scraper mati. Pemeliharaan rutin diperlukan untuk setiap site.
+Event tahunan yang situsnya di-rebuild tiap tahun = rebuild scraper tiap tahun.
+
+**LLM-Agent:**
+LLM membaca semantik konten, bukan CSS selector. Kalau layout berubah tapi konten tetap
+"nama perusahaan, negara, nomor booth", LLM tetap mengekstrak dengan benar.
+
+
+#### 4. Klasifikasi Konten Cerdas
+
+**BS4:**
+```python
+# Tidak bisa bedakan vendor vs menu vs artikel berita
+all_text = [tag.text for tag in soup.find_all("li")]
+# Hasilnya: ["About Us", "PT Maju Bersama", "Contact", "News", "Exhibitor Hall A"]
+# Semua masuk database
+```
+BS4 tidak punya konsep "ini vendor" vs "ini navigasi". Memerlukan regex rules panjang yang
+masih sering kecolongan.
+
+**LLM-Agent:**
+`_llm_classify_and_extract()` mengirim HTML ke LLM dengan prompt:
+> "Apakah halaman ini profil vendor/exhibitor? Kalau ya, ekstrak name/country/website/category."
+LLM secara kontekstual memahami perbedaan halaman profil perusahaan vs halaman about-us vs
+halaman menu navigasi. Filter `_validate_vendor()` menangkap sisa false positive dengan
+translated BAD_NAME_PATTERNS.
+
+
+#### 5. Pagination & Navigasi
+
+**BS4 (tipikal):**
+```python
+page = 1
+while True:
+    url = f"https://site.com/exhibitors?page={page}"
+    resp = httpx.get(url)
+    if resp.status_code == 404:
+        break
+    # parse ...
+    page += 1
+```
+Asumsi URL pattern `?page=N`. Tidak jalan untuk:
+- "Load More" button (butuh klik)
+- Infinite scroll (butuh Playwright)  
+- API-driven pagination (butuh intercept XHR)
+- Non-standard URL pattern
+
+**LLM-Agent:**
+`detect_next_button()` → deteksi tipe pagination dari HTML.
+`intercept_api_vendors()` → intercept XHR/fetch call untuk site SPA.
+Worker agent loop: scroll → cek item baru → scroll lagi sampai stabil.
+Semua ditangani dalam satu tool tanpa hardcode per-site.
+
+
+---
+
+
+### Kapan Pilih Mana?
+
+| Use Case | Rekomendasi | Alasan |
+|---|---|---|
+| **Site dengan struktur stabil, sering diakses** | BS4 | Cepat, murah, deterministic |
+| **Data pipeline produksi dengan SLA ketat** | BS4 + Playwright | Lebih predictable untuk monitoring |
+| **Crawl event pameran global (multi-bahasa, banyak site baru)** | **LLM-Agent** ✅ | Layout berbeda tiap event, bahasa beragam |
+| **One-time data collection dari 50+ domain berbeda** | **LLM-Agent** ✅ | Setup per-site tidak feasible |
+| **Budget sangat terbatas, volume tinggi** | BS4 | Zero LLM cost |
+| **Site yang ganti layout sering** | **LLM-Agent** ✅ | Tidak butuh maintenance selector |
+| **Research / explorasi data baru** | **LLM-Agent** ✅ | Tidak perlu tahu struktur site sebelumnya |
+
+
+---
+
+
+### Kesimpulan Jangka Panjang
+
+**BeautifulSoup4** adalah pilihan tepat untuk scraping satu atau beberapa site dengan
+struktur yang diketahui dan stabil. Cepat dibangun, mudah di-debug, dan cost operasional
+mendekati nol. Tapi untuk setiap site baru atau setiap perubahan layout, developer harus
+intervensi manual.
+
+**LLM-Agent Crawler** (proyek ini) adalah investasi yang proper untuk use case jangka panjang
+di mana:
+- Target site terus berubah (event tahunan, domain baru tiap cycle)
+- Konten multi-bahasa tanpa pola konsisten
+- Tim tidak punya kapasitas untuk maintain per-site selector
+- Kualitas data lebih penting dari kecepatan raw
+
+Trade-off utama: biaya LLM token dan kecepatan lebih lambat. Untuk volume 500-1000 vendor
+per run dengan GPT-4o-mini, estimasi biaya sekitar USD 0.10-0.30 per full crawl — sangat
+acceptable untuk data yang sebelumnya memerlukan kerja manual berjam-jam.
+
+**Rekomendasi untuk proyek ini:** LLM-Agent adalah arsitektur yang lebih tepat dan lebih
+reliable jangka panjang, karena target domain (expo & pameran industri global) memiliki
+heterogenitas tinggi dan tidak ada standar layout yang bisa diandalkan lintas organizer.

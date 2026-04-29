@@ -1,3 +1,4 @@
+import asyncio
 import re
 import json
 from typing import Optional, Any
@@ -36,7 +37,17 @@ def _translate(text: str, src: str, dest: str = "en") -> str:
 def _detect_lang(soup: BeautifulSoup) -> str:
     html_tag = soup.find("html")
     if html_tag and html_tag.get("lang"):
-        return html_tag["lang"].split("-")[0].lower()
+        lang = html_tag["lang"].split("-")[0].lower()
+        if lang:
+            return lang
+    # Content-based fallback — count CJK / Cyrillic chars in page text
+    text_sample = soup.get_text()[:1000]
+    cjk_count = sum(1 for c in text_sample if '一' <= c <= '鿿')
+    if cjk_count > 5:
+        return "zh"
+    cyrillic_count = sum(1 for c in text_sample if 'Ѐ' <= c <= 'ӿ')
+    if cyrillic_count > 5:
+        return "ru"
     return "unknown"
 
 
@@ -880,12 +891,15 @@ def _extract_with_llm_text(text: str, url: str, context: str = "", source_label:
         client = OpenAI(api_key=settings.openai_api_key)
 
         system_prompt = (
-            "Extract company/vendor info from the page text. "
-            "Output ONLY a valid JSON object with any of these keys: "
-            "name, website, email, phone, city, country, category, description. "
-            "Omit keys you are not confident about. No explanation, just JSON."
+            "You are a data extraction assistant. Extract ALL company/vendor information "
+            "visible on this page. Return ONLY a valid JSON object — no explanation, no markdown. "
+            "Use snake_case keys. Include any field you find: name, website, email, phone, "
+            "address, city, country, category, description, linkedin, twitter, booth_number, "
+            "event_name, event_location, event_date, specialized, classification, products, "
+            "services, certifications, founded_year, employees, revenue, or any other relevant field. "
+            "Omit keys you are not confident about. Values must be strings."
         )
-        context_suffix = f" (source: {context[:100]})" if context else ""
+        context_suffix = f"\nEvent context: {context[:200]}" if context else ""
         user_prompt = f"URL: {url}{context_suffix}\n\n{cleaned}"
 
         create_kwargs: dict = {
@@ -916,8 +930,14 @@ def _extract_with_llm_text(text: str, url: str, context: str = "", source_label:
                 return {}
             raw = json.loads(m.group(0))
 
-        valid_keys = {"name", "website", "email", "phone", "city", "country", "category", "description"}
-        result = {k: str(v).strip() for k, v in raw.items() if k in valid_keys and v and str(v).strip()}
+        # Accept ALL fields the LLM returns — no whitelist filter
+        # Normalize keys to snake_case, drop empty values, cap at 2000 chars per field
+        _SKIP = {"source_url", "extraction_method", "confidence_score"}
+        result = {}
+        for k, v in raw.items():
+            k_norm = re.sub(r"[^a-z0-9_]", "_", k.lower().strip()).strip("_")
+            if k_norm and k_norm not in _SKIP and v and str(v).strip():
+                result[k_norm] = str(v).strip()[:2000]
 
         if result:
             result["source_url"] = url
@@ -1005,14 +1025,41 @@ def _validate_vendor(vendor: dict) -> dict:
         r'menu|navigation|header|footer|sidebar|search|'
         r'copyright|all rights reserved|\d{4}|'
         # Listing/directory page titles — not real company names
-        r'exhibitors?(\s+(list|directory|search|results?|profile))?|'
-        r'vendors?(\s+(list|directory|search|results?))?|'
-        r'companies|company\s+(list|directory)|'
+        r'exhibitors?(\s+(list|directory|search|results?|profile|information|details?))?|'
+        r'vendors?(\s+(list|directory|search|results?|profile|information))?|'
+        r'companies|company\s+(list|directory|profile|information|details?|overview|introduction)?|'
+        # Generic page/section titles that are never a real company name
+        r'profile|company\s*profile|exhibitor\s*profile|vendor\s*profile|'
+        r'company\s*(info(rmation)?|details?|overview|introduction)|'
+        r'exhibitor\s*(info(rmation)?|details?|overview)|'
+        r'vendor\s*(info(rmation)?|details?)|'
+        r'about\s+(the\s+)?company|about\s+(the\s+)?exhibitor|'
+        r'enterprise\s*(profile|info(rmation)?|introduction)|'
         r'participants?(\s+list)?|sponsors?(\s+list)?|'
         r'our\s+(exhibitors?|vendors?|sponsors?|partners?)|'
         r'all\s+(exhibitors?|companies|vendors?)|'
         r'quick\s+links?|'
-        r'exhibitor\s+list|vendor\s+list|company\s+list)$',
+        r'exhibitor\s+list|vendor\s+list|company\s+list|'
+        # Translated Chinese navigation menu items (post-translation catches these)
+        r'overseas\s+(exhibition|expo|fair|show|event|engineering)|'
+        r'domestic\s+(exhibition|expo|fair|show)|'
+        r'(exhibition|booth|stand)\s+(construction|engineering|setup|service)|'
+        r'(organizational?|organisation(al)?)\s+(structure|chart)|'
+        r'corporate\s+(culture|values?|history|mission|vision)|'
+        r'company\s+culture|'
+        r'(join|recruit)\s+us|careers?|recruitment|'
+        r'news\s+(center|centre)|company\s+news|latest\s+news|'
+        r'more\s+(details?|info(rmation)?)|see\s+all|'
+        r'(aviation|aerospace|defense|automotive|maritime|marine|security|'
+        r'fire\s*fighting|surveillance).*(series|sector|type|category|zone)|'
+        # Chinese navigation items (direct match — fallback when translation fails)
+        r'公司介绍|企业介绍|关于我们|联系我们|加入我们|组织结构|企业文化|'
+        r'境外展|自办展|国内展示工程|海外搭建工程|展会新闻|新闻中心|展会动态|'
+        r'更多|查看更多|了解更多|返回首页|网站地图|'
+        r'航空.*防务|汽车.*汽配|船舶.*海事|安防.*消防|'
+        # Chinese news-headline patterns (verb + object constructs = sentences, not company names)
+        r'.*召开.*会议|.*举行.*会议|.*举办.*活动|.*签署.*协议|.*开展.*合作|.*发布.*报告|'
+        r'.*举行.*仪式|.*完成.*工作|.*取得.*成果|.*实现.*目标)$',
         re.IGNORECASE,
     )
 
@@ -1029,6 +1076,25 @@ def _validate_vendor(vendor: dict) -> dict:
     name = cleaned.get("name", "")
     if name:
         name = re.sub(r'\s+', ' ', name).strip()
+
+        # ── Translate non-English names BEFORE pattern matching ───────────────
+        # This is the last line of defence: even if upstream _extract_rule_based
+        # skipped translation (e.g. lang="unknown"), we force-translate here so
+        # BAD_NAME_PATTERNS can do its job on the English equivalent.
+        _has_cjk = any('一' <= c <= '鿿' for c in name)
+        _has_cyr = any('Ѐ' <= c <= 'ӿ' for c in name)
+        if _has_cjk:
+            _translated = _translate(name, "zh")
+            if _translated and _translated != name:
+                name = _translated
+                cleaned["name"] = name
+        elif _has_cyr:
+            _translated = _translate(name, "ru")
+            if _translated and _translated != name:
+                name = _translated
+                cleaned["name"] = name
+
+        # ── Standard validation ───────────────────────────────────────────────
         if len(name) < 2 or len(name) > 300:
             cleaned.pop("name", None)
         elif re.match(r'^\d+$', name):
@@ -1036,6 +1102,17 @@ def _validate_vendor(vendor: dict) -> dict:
         elif BAD_NAME_PATTERNS.match(name):
             cleaned.pop("name", None)
         elif len(name.split()) > 10:
+            # Long sentences (e.g. news headlines translated from Chinese) → not company names
+            cleaned.pop("name", None)
+        # Reject names ending in exhibition/category suffixes — never a real company name
+        elif re.search(r'\b(series|zone|pavilion|sector|segment|division|corridor|gallery|court)\s*$', name, re.IGNORECASE):
+            cleaned.pop("name", None)
+        # Reject slash-separated category shorthand: "X/Y" or "X/Y/Z"
+        # Real company names rarely contain slashes; exhibition categories always do
+        elif name.count("/") >= 2:
+            cleaned.pop("name", None)
+        elif name.count("/") == 1 and len(name) <= 40 and not re.search(r'[A-Z][a-z]{2,}.*[A-Z][a-z]{2,}', name):
+            # "Energy/Power" (len<40, no mixed-case proper nouns) → category, not a company
             cleaned.pop("name", None)
         else:
             cleaned["name"] = name
@@ -1779,20 +1856,25 @@ def run_extraction_pipeline(url: str, event_context: dict = None) -> dict:
     event_ctx = event_context or {}
 
     result = _extract_schema_org(html, url)
-    if _count_populated(result) >= settings.min_vendor_fields:
+    # Check AFTER validate so bad names (e.g. "Company Profile") are caught early
+    _validated_schema = _validate_vendor(result) if _count_populated(result) >= settings.min_vendor_fields else {}
+    if _validated_schema.get("name"):
         if event_ctx:
-            result.update({k: v for k, v in event_ctx.items() if v and not result.get(k)})
-        return _reg(_validate_vendor(result))
+            _validated_schema.update({k: v for k, v in event_ctx.items() if v and not _validated_schema.get(k)})
+        return _reg(_validated_schema)
 
     rule_result = _extract_rule_based(html, url)
-    if _count_populated(rule_result) >= settings.min_vendor_fields:
-        merged = _merge_vendor_data([result, rule_result])
+    _validated_rule = _validate_vendor(_merge_vendor_data([result, rule_result])) if _count_populated(rule_result) >= settings.min_vendor_fields else {}
+    if _validated_rule.get("name"):
         if event_ctx:
-            merged.update({k: v for k, v in event_ctx.items() if v and not merged.get(k)})
-        return _reg(_validate_vendor(merged))
+            _validated_rule.update({k: v for k, v in event_ctx.items() if v and not _validated_rule.get(k)})
+        return _reg(_validated_rule)
 
+    # Either not enough fields OR name was a generic phrase → fall through to LLM
     combined = _merge_vendor_data([r for r in [result, rule_result] if r])
-    if _count_populated(combined) < settings.min_vendor_fields:
+    # Try LLM if: not enough populated fields, OR the name is missing/empty in combined result
+    _combined_has_valid_name = bool(_validate_vendor(dict(combined)).get("name") if combined else False)
+    if _count_populated(combined) < settings.min_vendor_fields or not _combined_has_valid_name:
         context_str = event_ctx.get("event_name", "") if event_ctx else ""
 
         # Prefer Jina AI Reader (clean markdown → LLM) over raw HTML → LLM
@@ -1814,11 +1896,223 @@ def run_extraction_pipeline(url: str, event_context: dict = None) -> dict:
     return _reg(_validate_vendor(combined))
 
 
+async def _llm_classify_and_extract(url: str, html: str, event_ctx: dict) -> dict:
+    """
+    One LLM call that does TWO things at once:
+      1. Classify: is this page a real vendor/company profile?
+      2. If yes: extract all available company fields.
+    Returns vendor dict (with extraction_method="llm_classify") or {} if not a vendor page.
+    """
+    settings = get_settings()
+    if not settings.effective_llm_enabled:
+        return {}
+
+    try:
+        import html2text as h2t
+        converter = h2t.HTML2Text()
+        converter.ignore_links = False
+        converter.ignore_images = True
+        converter.body_width = 0
+        text = converter.handle(html)
+    except Exception:
+        text = html
+
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip() and len(ln.strip()) > 3]
+    cleaned = "\n".join(lines[:100])[:2500]   # ~600 tokens max
+
+    event_name = event_ctx.get("event_name", "")
+
+    system = (
+        "You are a vendor data extractor for a trade-show exhibitor database.\n\n"
+        "STEP 1 — CLASSIFY this page:\n"
+        "  VENDOR: a real company/exhibitor profile page (company info, products, contacts)\n"
+        "  NOT_VENDOR: navigation item, exhibition category/series, news article, "
+        "organizer page, government page, generic topic page\n\n"
+        "STEP 2 — If VENDOR: extract every available field into JSON.\n"
+        "  Fields: name, website, email, phone, address, city, country, category, "
+        "description, linkedin, twitter, booth_number, and any other relevant field.\n\n"
+        "STEP 3 — Return ONLY valid JSON:\n"
+        "  If VENDOR  → {\"name\": \"...\", \"website\": \"...\", ...}\n"
+        "  If NOT_VENDOR → {}\n\n"
+        "No explanation. No markdown. Pure JSON only."
+    )
+    user = f"URL: {url}\nEvent: {event_name}\n\nPage content:\n{cleaned}"
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        kwargs: dict = {
+            "model": settings.openai_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_completion_tokens": 600,
+        }
+        if settings.model_supports_temperature:
+            kwargs["temperature"] = 0.0
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = await client.chat.completions.create(**kwargs)
+        content = (response.choices[0].message.content or "").strip()
+
+        if not content or content in ("{}", "{ }"):
+            return {}
+
+        try:
+            raw = json.loads(content)
+        except json.JSONDecodeError:
+            m = re.search(r"\{[^{}]*\}", content, re.DOTALL)
+            raw = json.loads(m.group(0)) if m else {}
+
+        if not raw:
+            return {}
+
+        _SKIP = {"source_url", "extraction_method", "confidence_score"}
+        result = {}
+        for k, v in raw.items():
+            k_norm = re.sub(r"[^a-z0-9_]", "_", k.lower().strip()).strip("_")
+            if k_norm and k_norm not in _SKIP and v and str(v).strip():
+                result[k_norm] = str(v).strip()[:2000]
+
+        if result:
+            result["source_url"] = url
+            result["extraction_method"] = "llm_classify"
+            result["confidence_score"] = min(_count_populated(result) / 5.0, 1.0)
+
+        return result
+
+    except Exception as e:
+        logger.debug(f"[LLM-CLASSIFY] {url}: {e}")
+        return {}
+
+
+@tool
+async def extract_all_vendor_profiles(
+    vendor_urls: list[str],
+    event_context: str = "{}",
+    max_concurrent: int = 8,
+) -> dict:
+    """
+    GUNAKAN INI INSTEAD OF memanggil run_extraction_pipeline() dalam loop!
+
+    Ekstrak BANYAK URL vendor sekaligus secara PARALEL dengan LLM sebagai primary extractor.
+    Setiap URL diproses oleh LLM yang:
+      1. Memvalidasi: "apakah ini halaman vendor/perusahaan beneran?"
+      2. Jika ya: ekstrak semua field yang tersedia
+      3. Jika tidak (navigasi, kategori, berita): otomatis diskip
+
+    Keuntungan vs run_extraction_pipeline loop:
+      - 8 URL diproses BERSAMAAN (bukan satu-satu)
+      - LLM membaca konten → tidak ada lagi "Food series" atau kategori abal-abal
+      - 1 tool call mengganti 20+ tool calls
+
+    vendor_urls: list URL profil vendor dari discover_vendor_urls()
+    event_context: JSON string dengan event_name, event_location, event_date
+    max_concurrent: URL yang diproses bersamaan (default 8, max 15)
+
+    Return: {registered, skipped, total_in_registry, elapsed, sample}
+    """
+    import time as _time
+
+    ctx: dict = {}
+    if isinstance(event_context, str) and event_context.strip():
+        try:
+            ctx = json.loads(event_context)
+        except Exception:
+            pass
+    elif isinstance(event_context, dict):
+        ctx = event_context
+
+    from backend.tools.fetch_tools import get_cached_html, fetch_page_async
+    from backend.tools.vendor_registry import register_vendor, get_count
+
+    settings = get_settings()
+    sem = asyncio.Semaphore(min(max_concurrent, 15))
+    t0 = _time.time()
+    registered: list[dict] = []
+
+    async def _process_one(url: str) -> dict | None:
+        async with sem:
+            # ── 1. Get HTML (cache-first, then async fetch) ───────────────────
+            html = get_cached_html(url)
+            if not html:
+                try:
+                    res = await fetch_page_async(url)
+                    html = res.get("html", "")
+                except Exception as e:
+                    logger.debug(f"[BATCH-EXTRACT] fetch failed {url}: {e}")
+                    return None
+
+            if not html or len(html) < 200:
+                return None
+
+            # ── 2. schema.org fast path ───────────────────────────────────────
+            schema = _extract_schema_org(html, url)
+            v_schema = _validate_vendor(schema) if _count_populated(schema) >= 3 else {}
+            if v_schema.get("name"):
+                if ctx:
+                    v_schema.update({k: v for k, v in ctx.items() if v and not v_schema.get(k)})
+                register_vendor(v_schema)
+                return v_schema
+
+            # ── 3. LLM classify + extract (primary, not fallback) ─────────────
+            if settings.effective_llm_enabled:
+                llm_result = await _llm_classify_and_extract(url, html, ctx)
+                if llm_result:
+                    validated = _validate_vendor(llm_result)
+                    if validated.get("name"):
+                        if ctx:
+                            validated.update({k: v for k, v in ctx.items() if v and not validated.get(k)})
+                        register_vendor(validated)
+                        return validated
+
+            # ── 4. rule_based supplement only (last resort, no LLM) ───────────
+            rule = _extract_rule_based(html, url)
+            v_rule = _validate_vendor(_merge_vendor_data([schema, rule])) if _count_populated(rule) >= 3 else {}
+            if v_rule.get("name"):
+                if ctx:
+                    v_rule.update({k: v for k, v in ctx.items() if v and not v_rule.get(k)})
+                register_vendor(v_rule)
+                return v_rule
+
+            return None
+
+    tasks = [_process_one(url) for url in vendor_urls]
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in raw:
+        if isinstance(r, dict) and r.get("name"):
+            registered.append(r)
+
+    elapsed = round(_time.time() - t0, 1)
+    total = get_count()
+    skipped = len(vendor_urls) - len(registered)
+
+    logger.debug(
+        f"[BATCH-EXTRACT] {len(registered)}/{len(vendor_urls)} valid vendors "
+        f"({skipped} skipped as non-vendor) in {elapsed}s"
+    )
+
+    return {
+        "registered": len(registered),
+        "skipped": skipped,
+        "total_in_registry": total,
+        "elapsed": elapsed,
+        "sample": registered[:3],
+        "message": (
+            f"Parallel LLM extraction: {len(registered)} valid vendors "
+            f"from {len(vendor_urls)} URLs ({skipped} skipped as non-vendor) in {elapsed}s"
+        ),
+    }
+
+
 from backend.tools.vendor_registry import get_vendor_count
 from backend.tools.dynamic_parser_tool import generate_and_run_parser
 
 ALL_EXTRACT_TOOLS = [
     run_extraction_pipeline,
+    extract_all_vendor_profiles,
     discover_vendor_urls,
     extract_vendors_from_pdf,
     get_vendor_count,

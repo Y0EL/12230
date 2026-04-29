@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -18,24 +19,54 @@ from backend.core.config import get_settings
 
 _settings = get_settings()
 
-VENDOR_COLUMNS = [
-    ("name",           "Company Name",       35),
-    ("website",        "Website",            30),
-    ("email",          "Email",              28),
-    ("phone",          "Phone",              18),
-    ("address",        "Address",            35),
-    ("city",           "City",               18),
-    ("country",        "Country",            15),
-    ("category",       "Category",           22),
-    ("description",    "Description",        55),
-    ("linkedin",       "LinkedIn",           30),
-    ("twitter",        "Twitter / X",        25),
-    ("booth_number",   "Booth / Stand",      14),
-    ("event_name",     "Event Name",         30),
-    ("event_location", "Event Location",     22),
-    ("event_date",     "Event Date",         15),
-    ("source_url",     "Source URL",         35),
+# Priority columns — always appear first, in this order.
+# Any extra fields returned by the LLM are appended dynamically.
+PRIORITY_COLUMNS = [
+    ("name",              "Company Name",    35),
+    ("website",           "Website",         30),
+    ("email",             "Email",           28),
+    ("phone",             "Phone",           18),
+    ("address",           "Address",         35),
+    ("city",              "City",            18),
+    ("country",           "Country",         15),
+    ("category",          "Category",        22),
+    ("description",       "Description",     55),
+    ("linkedin",          "LinkedIn",        30),
+    ("twitter",           "Twitter / X",     25),
+    ("booth_number",      "Booth / Stand",   14),
+    ("event_name",        "Event Name",      30),
+    ("event_location",    "Event Location",  22),
+    ("event_date",        "Event Date",      15),
+    ("source_url",        "Source URL",      35),
+    ("extraction_method", "Extract Method",  22),
+    ("confidence_score",  "Confidence",      12),
 ]
+
+# Keep VENDOR_COLUMNS as alias for backward-compat (dedup sheet still uses it)
+VENDOR_COLUMNS = PRIORITY_COLUMNS
+
+_URL_FIELDS = {"website", "linkedin", "twitter", "source_url"}
+
+
+def _build_dynamic_columns(vendors: list[dict]) -> list[tuple[str, str, int]]:
+    """Return column definitions: priority fields first, then any extra LLM-generated
+    fields sorted by how many vendors have that field filled (most common first)."""
+    from collections import Counter
+
+    priority_keys = {f for f, _, _ in PRIORITY_COLUMNS}
+
+    extra_counts: Counter = Counter()
+    for vendor in vendors:
+        for k, v in vendor.items():
+            if k not in priority_keys and v and str(v).strip():
+                extra_counts[k] += 1
+
+    result = list(PRIORITY_COLUMNS)
+    for extra_key, _ in extra_counts.most_common():
+        header = extra_key.replace("_", " ").title()
+        result.append((extra_key, header, 22))
+
+    return result
 
 COLOR_HEADER_BG   = "1E3A5F"
 COLOR_HEADER_FONT = "FFFFFF"
@@ -91,16 +122,31 @@ def _sanitize_cell(value) -> str:
     if value is None:
         return ""
     val = str(value).strip()
-    val = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', val)
+    # Remove ASCII control chars and Windows-1252 garbage range
+    val = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', val)
+    # Detect binary garbage: >30% non-ASCII that isn't real CJK/Cyrillic/Arabic/Latin-ext
+    non_ascii = sum(1 for c in val if ord(c) > 127)
+    if len(val) > 10 and (non_ascii / len(val)) > 0.30:
+        real_unicode = sum(
+            1 for c in val
+            if 0x00C0 <= ord(c) <= 0x024F   # Latin extended
+            or 0x0400 <= ord(c) <= 0x04FF   # Cyrillic
+            or 0x0600 <= ord(c) <= 0x06FF   # Arabic
+            or 0x4E00 <= ord(c) <= 0x9FFF   # CJK
+            or 0xAC00 <= ord(c) <= 0xD7AF   # Korean
+        )
+        if real_unicode < non_ascii * 0.5:
+            return ""  # looks like binary PDF leak — discard
     return val[:32767]
 
 
 def _build_vendors_sheet(ws, vendors: list[dict]) -> None:
     h_font, h_fill, h_align = _make_header_style()
+    columns = _build_dynamic_columns(vendors)
 
     ws.row_dimensions[1].height = 22
 
-    for col_idx, (field, header, width) in enumerate(VENDOR_COLUMNS, start=1):
+    for col_idx, (field, header, width) in enumerate(columns, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font = h_font
         cell.fill = h_fill
@@ -109,14 +155,14 @@ def _build_vendors_sheet(ws, vendors: list[dict]) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(VENDOR_COLUMNS))}1"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}1"
 
     for row_idx, vendor in enumerate(vendors, start=2):
         method = vendor.get("extraction_method", "")
         v_font, v_fill, v_align = _make_cell_style(row_idx, method)
         ws.row_dimensions[row_idx].height = 16
 
-        for col_idx, (field, _, _) in enumerate(VENDOR_COLUMNS, start=1):
+        for col_idx, (field, _, _) in enumerate(columns, start=1):
             raw_val = vendor.get(field, "")
             if field == "confidence_score" and raw_val:
                 try:
@@ -129,7 +175,7 @@ def _build_vendors_sheet(ws, vendors: list[dict]) -> None:
             cell.alignment = v_align
             cell.border = THIN_BORDER
 
-            if field in ("website", "linkedin", "twitter", "source_url"):
+            if field in _URL_FIELDS:
                 url_val = vendor.get(field, "")
                 if url_val and url_val.startswith("http"):
                     cell.hyperlink = url_val
@@ -372,13 +418,14 @@ def export_to_csv(vendors: list[dict] = [], query: str = "", title: str = "") ->
     filename = f"{safe_title}_{timestamp}.csv"
     output_path = settings.output_path / filename
 
-    columns = [field for field, _, _ in VENDOR_COLUMNS]
+    dyn_cols = _build_dynamic_columns(vendors)
+    col_keys = [field for field, _, _ in dyn_cols]
     rows = []
     for vendor in vendors:
-        row = {col: _sanitize_cell(vendor.get(col, "")) for col in columns}
+        row = {col: _sanitize_cell(vendor.get(col, "")) for col in col_keys}
         rows.append(row)
 
-    df = pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(rows, columns=col_keys)
     df.to_csv(str(output_path), index=False, encoding="utf-8-sig")
     logger.info(f"CSV exported: {output_path} ({len(vendors)} vendors)")
     return str(output_path)
@@ -420,9 +467,23 @@ def _do_deduplicate(vendors: list[dict]) -> list[dict]:
     for vendor in vendors:
         name_key = normalize_name(vendor.get("name", ""))
         domain_key = get_domain(vendor.get("website", ""))
-        key = domain_key if domain_key else name_key
-        if not key:
-            key = f"__unnamed_{id(vendor)}"
+        source_domain_key = get_domain(vendor.get("source_url", ""))
+        # Include event context so vendors from different events are never merged.
+        event_key = vendor.get("event_name", "").lower().strip()[:20]
+
+        # Only use website domain as dedup key when it's genuinely the vendor's
+        # OWN external website (different from the expo/event site).
+        # If website domain == source_url domain (e.g., all exhibitors scraped from
+        # gartner.com have website=gartner.com), we'd collapse 22 vendors into 1.
+        # In that case, fall back to name-based dedup so each company stays separate.
+        if domain_key and domain_key != source_domain_key:
+            base_key = domain_key   # external vendor website — good dedup signal
+        elif name_key:
+            base_key = name_key     # no distinct external website → distinct by name
+        else:
+            base_key = f"__unnamed_{id(vendor)}"
+
+        key = f"{base_key}|{event_key}" if event_key else base_key
         groups[key].append(vendor)
 
     deduped = []
@@ -433,7 +494,8 @@ def _do_deduplicate(vendors: list[dict]) -> list[dict]:
             best = max(group, key=lambda v: v.get("confidence_score", 0))
             for other in group:
                 if other is not best:
-                    for field, _, _ in VENDOR_COLUMNS:
+                    all_fields = set(best.keys()) | set(other.keys())
+                    for field in all_fields:
                         if not best.get(field) and other.get(field):
                             best[field] = other[field]
             deduped.append(best)
@@ -479,4 +541,54 @@ def deduplicate_vendors(vendors: list[dict] = []) -> dict:
     return {"original_count": len(source), "deduped_count": len(deduped), "message": msg}
 
 
-ALL_EXPORT_TOOLS = [export_to_excel, export_to_csv, deduplicate_vendors]
+@tool
+def export_to_json(vendors: list[dict] = [], query: str = "", title: str = "") -> str:
+    """
+    Export vendor list to a dynamic JSON file.
+    If vendors list is empty (or not provided), exports from the global registry.
+    Output is a JSON array of vendor objects — only fields that actually have data
+    are included (fully dynamic, no fixed schema).
+
+    Args:
+        query: original user query string
+        title: short descriptive filename (same as used for Excel/CSV). Example: "Global_Defense_Asia_2026"
+    Returns the absolute file path of the created JSON file.
+    """
+    from backend.tools.vendor_registry import get_all_vendors
+    settings = get_settings()
+
+    registry = get_all_vendors()
+    effective_vendors = registry if registry else vendors
+    if not effective_vendors:
+        return ""
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if title and title.strip():
+        safe_title = re.sub(r'[^\w\s-]', '', title.strip())[:60].replace(" ", "_")
+    else:
+        safe_title = re.sub(r'[^\w\s-]', '', query)[:40].strip().replace(" ", "_")
+    filename = f"{safe_title}_{timestamp}.json"
+    output_path = settings.output_path / filename
+
+    # Build fully dynamic records — only include fields that have non-empty values.
+    # Each vendor may have different fields (dynamic schema).
+    clean_vendors = []
+    for vendor in effective_vendors:
+        record = {
+            k: v for k, v in vendor.items()
+            if v is not None and v != "" and v != [] and v != {}
+        }
+        # Always include name and source_url even if empty (anchor fields for readability)
+        record.setdefault("name", "")
+        record.setdefault("source_url", "")
+        clean_vendors.append(record)
+
+    output_path.write_text(
+        json.dumps(clean_vendors, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(f"JSON exported: {output_path} ({len(clean_vendors)} vendors)")
+    return str(output_path)
+
+
+ALL_EXPORT_TOOLS = [export_to_excel, export_to_csv, export_to_json, deduplicate_vendors]

@@ -361,10 +361,16 @@ def stop_thinking(final_text: str = "") -> None:
 
 
 def print_tool_start(tool_name: str, args: dict) -> None:
-    arg_preview = "  ".join(
-        f"[dim]{k}[/dim]=[dim white]{escape(str(v)[:60])}[/dim white]"
-        for k, v in list(args.items())[:3]
-    )
+    parts = []
+    for k, v in list(args.items())[:5]:
+        # Lists of URLs: print each URL on its own line
+        if isinstance(v, list) and v and isinstance(v[0], str) and v[0].startswith("http"):
+            urls_str = "\n              ".join(v)
+            parts.append(f"[dim]{k}[/dim]=[\n              {escape(urls_str)}\n            ]")
+        else:
+            # Strings: no truncation — show full value
+            parts.append(f"[dim]{k}[/dim]=[dim white]{escape(str(v))}[/dim white]")
+    arg_preview = "  ".join(parts)
     console.print(
         f"  [bold cyan][TOOL]  [/bold cyan]"
         f"[bold white]{tool_name}[/bold white]  {arg_preview}",
@@ -376,7 +382,7 @@ def print_tool_end(tool_name: str, result_summary: str) -> None:
     console.print(
         f"  [dim green][TOOL]  [/dim green]"
         f"[dim]{tool_name}[/dim]  "
-        f"[dim green]selesai: {escape(result_summary[:100])}[/dim green]",
+        f"[dim green]selesai: {escape(result_summary)}[/dim green]",
         highlight=False,
     )
 
