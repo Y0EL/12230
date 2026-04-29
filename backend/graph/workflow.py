@@ -13,6 +13,7 @@ from backend.tools.search_tools import ALL_SEARCH_TOOLS
 from backend.tools.fetch_tools import ALL_FETCH_TOOLS
 from backend.tools.extract_tools import ALL_EXTRACT_TOOLS
 from backend.tools.export_tools import ALL_EXPORT_TOOLS
+from backend.tools.enrich_tools import enrich_vendors_parallel
 from backend.utils.display import start_thinking, update_thinking, stop_thinking, print_tool_start, print_tool_end
 
 _settings = get_settings()
@@ -51,7 +52,7 @@ def _build_llm() -> ChatOpenAI:
 
 def build_react_agent(system_prompt: str):
     llm = _build_llm()
-    all_tools = ALL_SEARCH_TOOLS + ALL_FETCH_TOOLS + ALL_EXTRACT_TOOLS + ALL_EXPORT_TOOLS
+    all_tools = ALL_SEARCH_TOOLS + ALL_FETCH_TOOLS + ALL_EXTRACT_TOOLS + ALL_EXPORT_TOOLS + [enrich_vendors_parallel]
     return create_react_agent(
         model=llm,
         tools=all_tools,
@@ -115,7 +116,7 @@ _TOP_LEVEL_TOOLS = {
     "search_exhibitor_events", "search_vendor_directory", "search_company_info",
     "fetch_page", "fetch_pages_batch", "check_robots_txt", "resolve_final_url",
     "run_extraction_pipeline", "discover_vendor_urls", "extract_vendors_from_pdf",
-    "get_vendor_count", "generate_and_run_parser",
+    "get_vendor_count", "generate_and_run_parser", "enrich_vendors_parallel",
     "deduplicate_vendors", "export_to_excel", "export_to_csv",
 }
 

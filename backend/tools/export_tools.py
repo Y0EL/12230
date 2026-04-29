@@ -27,7 +27,7 @@ VENDOR_COLUMNS = [
     ("city",           "City",               18),
     ("country",        "Country",            15),
     ("category",       "Category",           22),
-    ("description",    "Description",        50),
+    ("description",    "Description",        55),
     ("linkedin",       "LinkedIn",           30),
     ("twitter",        "Twitter / X",        25),
     ("booth_number",   "Booth / Stand",      14),
@@ -35,8 +35,6 @@ VENDOR_COLUMNS = [
     ("event_location", "Event Location",     22),
     ("event_date",     "Event Date",         15),
     ("source_url",     "Source URL",         35),
-    ("extraction_method", "Extract Method",  15),
-    ("confidence_score",  "Confidence",       10),
 ]
 
 COLOR_HEADER_BG   = "1E3A5F"
@@ -141,9 +139,10 @@ def _build_vendors_sheet(ws, vendors: list[dict]) -> None:
 
 
 def _build_stats_sheet(ws, vendors: list[dict], query: str, stats: dict) -> None:
+    from collections import Counter
     h_font, h_fill, h_align = _make_header_style()
 
-    ws["A1"] = "MEGA CRAWLER BOT — Run Summary"
+    ws["A1"] = "MEGA CRAWLER BOT  Run Summary"
     ws["A1"].font = Font(name="Calibri", bold=True, size=14, color=COLOR_ACCENT)
     ws.row_dimensions[1].height = 28
 
@@ -160,19 +159,45 @@ def _build_stats_sheet(ws, vendors: list[dict], query: str, stats: dict) -> None
     for row in [3, 4, 5]:
         ws.cell(row=row, column=1).font = label_font
 
+    # Compute real metrics from vendor data
+    n = len(vendors) or 1
+    methods = Counter(v.get("extraction_method", "") for v in vendors)
+    schema_org = sum(v for k, v in methods.items() if "schema_org" in k)
+    rule_based = sum(v for k, v in methods.items() if "rule_based" in k)
+    llm_used   = sum(v for k, v in methods.items() if "llm" in k)
+    pdf_based  = sum(v for k, v in methods.items() if "pdf" in k)
+
+    def fill_rate(field):
+        filled = sum(1 for v in vendors if v.get(field))
+        return f"{filled} ({filled*100//n}%)"
+
+    countries_found = sum(1 for v in vendors if v.get("country"))
+    unique_countries = len({v.get("country") for v in vendors if v.get("country")})
+    events_found = len({v.get("event_name") for v in vendors if v.get("event_name")})
+
     stat_rows = [
-        ("Pages Crawled", stats.get("total_crawled", 0)),
-        ("Vendor Pages Found", stats.get("total_vendor_pages", 0)),
-        ("via schema.org", stats.get("extraction_schema_org", 0)),
-        ("via rule_based", stats.get("extraction_rule_based", 0)),
-        ("via LLM fallback", stats.get("extraction_llm", 0)),
-        ("Extraction Failed", stats.get("extraction_failed", 0)),
-        ("LLM Usage %", f"{stats.get('llm_percentage', 0):.1f}%"),
-        ("Est. LLM Cost (USD)", f"${stats.get('estimated_llm_cost_usd', 0):.4f}"),
-        ("Countries Found", stats.get("countries_found", 0)),
-        ("Events Found", stats.get("events_found", 0)),
-        ("Success Rate", f"{stats.get('success_rate', 0):.1f}%"),
+        ("Total Vendors", len(vendors)),
+        ("Unique Countries", unique_countries),
+        ("Events / Expos", events_found),
+        ("", ""),
+        ("— Extraction Methods —", ""),
+        ("via PDF table", pdf_based),
+        ("via schema.org", schema_org),
+        ("via rule_based", rule_based),
+        ("via LLM fallback", llm_used),
+        ("", ""),
+        ("— Field Fill Rates —", ""),
+        ("with Country", fill_rate("country")),
+        ("with Website", fill_rate("website")),
+        ("with Email", fill_rate("email")),
+        ("with Phone", fill_rate("phone")),
+        ("with Description", fill_rate("description")),
+        ("with LinkedIn", fill_rate("linkedin")),
+        ("with Booth Number", fill_rate("booth_number")),
+        ("with Event Name", fill_rate("event_name")),
+        ("", ""),
         ("Elapsed (sec)", stats.get("elapsed_seconds", 0)),
+        ("Est. LLM Cost (USD)", f"${stats.get('estimated_llm_cost_usd', 0):.4f}"),
     ]
 
     row_start = 7
@@ -254,7 +279,7 @@ def _build_dedup_check_sheet(ws, vendors: list[dict]) -> None:
 
 
 @tool
-def export_to_excel(vendors: list[dict] = [], query: str = "", stats: dict = None) -> str:
+def export_to_excel(vendors: list[dict] = [], query: str = "", stats: dict = None, title: str = "") -> str:
     """
     Export vendor list to a formatted Excel file with multiple sheets:
     Sheet 1: All vendors with colored rows by extraction method
@@ -262,14 +287,17 @@ def export_to_excel(vendors: list[dict] = [], query: str = "", stats: dict = Non
     Sheet 3: Duplicate check
 
     If vendors list is empty (or not provided), exports from the global registry.
-    Always pass query = the original user query string.
+    Args:
+        query: original user query string (required)
+        title: short descriptive filename (2-5 words, no extension). AI should generate this.
+               Example: "Global_Defense_Security_Asia_2026" or "DSEI_MSPO_Eurosatory_Exhibitors"
+               If not provided, auto-generated from query.
 
     Returns the absolute file path of the created Excel file.
     """
     from backend.tools.vendor_registry import get_all_vendors
     settings = get_settings()
 
-    # Prefer registry over passed vendors (registry always has the full, deduped set)
     registry = get_all_vendors()
     effective_vendors = registry if registry else vendors
 
@@ -281,12 +309,16 @@ def export_to_excel(vendors: list[dict] = [], query: str = "", stats: dict = Non
 
     stats = stats or {}
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_query = re.sub(r'[^\w\s-]', '', query)[:30].strip().replace(" ", "_")
-    filename = f"vendors_{safe_query}_{timestamp}.xlsx"
+
+    if title and title.strip():
+        safe_title = re.sub(r'[^\w\s-]', '', title.strip())[:60].replace(" ", "_")
+    else:
+        safe_title = re.sub(r'[^\w\s-]', '', query)[:40].strip().replace(" ", "_")
+    filename = f"{safe_title}_{timestamp}.xlsx"
     output_path = settings.output_path / filename
 
     wb = openpyxl.Workbook()
-    wb.properties.title = f"Vendor List — {query}"
+    wb.properties.title = title or query
     wb.properties.creator = "Mega Crawler Bot"
     wb.properties.description = f"Generated {datetime.now().isoformat()}"
 
@@ -312,17 +344,18 @@ def export_to_excel(vendors: list[dict] = [], query: str = "", stats: dict = Non
 
 
 @tool
-def export_to_csv(vendors: list[dict] = [], query: str = "") -> str:
+def export_to_csv(vendors: list[dict] = [], query: str = "", title: str = "") -> str:
     """
     Export vendor list to a CSV file.
     If vendors list is empty (or not provided), exports from the global registry.
-    Always pass query = the original user query string.
+    Args:
+        query: original user query string
+        title: short descriptive filename (same as used for Excel). Example: "Global_Defense_Asia_2026"
     Returns the absolute file path of the created CSV file.
     """
     from backend.tools.vendor_registry import get_all_vendors
     settings = get_settings()
 
-    # Prefer registry over passed vendors
     registry = get_all_vendors()
     effective_vendors = registry if registry else vendors
 
@@ -332,8 +365,11 @@ def export_to_csv(vendors: list[dict] = [], query: str = "") -> str:
     vendors = effective_vendors
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_query = re.sub(r'[^\w\s-]', '', query)[:30].strip().replace(" ", "_")
-    filename = f"vendors_{safe_query}_{timestamp}.csv"
+    if title and title.strip():
+        safe_title = re.sub(r'[^\w\s-]', '', title.strip())[:60].replace(" ", "_")
+    else:
+        safe_title = re.sub(r'[^\w\s-]', '', query)[:40].strip().replace(" ", "_")
+    filename = f"{safe_title}_{timestamp}.csv"
     output_path = settings.output_path / filename
 
     columns = [field for field, _, _ in VENDOR_COLUMNS]

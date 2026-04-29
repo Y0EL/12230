@@ -1543,6 +1543,54 @@ def _run_coro_sync(coro) -> object:
         return asyncio.run(coro)
 
 
+def _extract_event_metadata_from_pdf(markdown: str, source_url: str) -> dict:
+    """Extract event_name, event_location, event_date from the first lines of PDF markdown."""
+    import re as _re
+    from urllib.parse import urlparse
+
+    lines = [l.strip() for l in markdown.split("\n")[:40] if l.strip() and not l.startswith("|")]
+    header_text = " ".join(lines[:15])
+
+    name = location = date = ""
+
+    # Event name: first meaningful heading (skip generic/short lines)
+    for line in lines[:10]:
+        clean = _re.sub(r"[#*_\[\]]", "", line).strip()
+        clean = _re.sub(r"\s+", " ", clean)
+        if len(clean) > 8 and not _re.match(r"^\d", clean) and "www." not in clean.lower():
+            name = clean[:80]
+            break
+
+    # Location: city name only
+    loc_pat = _re.search(
+        r"\b(Kuala Lumpur|Dubai|Abu Dhabi|Paris|London|Berlin|Seoul|Singapore|Jakarta|Tokyo|Washington|Moscow|Beijing|Istanbul|Sydney|Ankara|Riyadh|Athens)\b",
+        header_text, _re.IGNORECASE
+    )
+    if loc_pat:
+        location = loc_pat.group(0).strip()
+
+    # Date: look for date patterns
+    date_pat = _re.search(
+        r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-–]+\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}"
+        r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"
+        r"|\d{4}-\d{2}-\d{2}",
+        header_text, _re.IGNORECASE
+    )
+    if date_pat:
+        date = date_pat.group(0).strip()
+
+    # Fallback: use domain to infer event name
+    if not name:
+        domain = urlparse(source_url).netloc.replace("www.", "")
+        name = domain.split(".")[0].upper()
+
+    return {
+        "event_name": name or "",
+        "event_location": location or "",
+        "event_date": date or "",
+    }
+
+
 def _extract_vendors_from_pdf(url: str) -> list[dict]:
     """
     Fetch a PDF and extract all vendor/exhibitor records.
@@ -1583,9 +1631,20 @@ def _extract_vendors_from_pdf(url: str) -> list[dict]:
         logger.warning(f"[PDF] No content from any parser for {url}")
         return []
 
+    # ── Extract event metadata from PDF header ────────────────────────────────
+    event_meta = _extract_event_metadata_from_pdf(markdown, url)
+
+    def _inject_event(vendors_list: list[dict]) -> list[dict]:
+        for v in vendors_list:
+            for k, val in event_meta.items():
+                if val and not v.get(k):
+                    v[k] = val
+        return vendors_list
+
     # ── Parser 1: Markdown table (Firecrawl output) ───────────────────────────
     table_vendors = _parse_exhibitor_pdf_table(markdown, url)
     if table_vendors and len(table_vendors) >= 3:
+        _inject_event(table_vendors)
         validated = [v for v in (_validate_vendor(v) for v in table_vendors) if v]
         logger.info(f"[PDF] Table parser: {len(validated)} valid vendors")
         from backend.tools.vendor_registry import register_vendors
@@ -1596,6 +1655,7 @@ def _extract_vendors_from_pdf(url: str) -> list[dict]:
     # ── Parser 2: Numbered text (Jina / DSA-style) ───────────────────────────
     numbered_vendors = _parse_exhibitor_pdf_markdown(markdown, url)
     if numbered_vendors and len(numbered_vendors) >= 3:
+        _inject_event(numbered_vendors)
         validated = [v for v in (_validate_vendor(v) for v in numbered_vendors) if v]
         logger.info(f"[PDF] Numbered parser: {len(validated)} valid vendors")
         from backend.tools.vendor_registry import register_vendors

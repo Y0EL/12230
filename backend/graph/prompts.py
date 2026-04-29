@@ -3,9 +3,9 @@ def build_system_prompt(max_vendors: int = 10000, skip_enrich: bool = False) -> 
         "Lewati fase enrichment."
         if skip_enrich
         else (
-            "Setelah ekstraksi semua halaman expo, enrich vendor yang masih kosong field-nya "
-            "(email, phone, country, description) dengan memanggil "
-            "run_extraction_pipeline(url=vendor_website) pada homepage mereka."
+            "LANGKAH 2 WAJIB: enrich_vendors_parallel(max_concurrent=15, max_vendors=200)\n"
+            "Ini TIDAK opsional. Panggil sebelum dedup dan export.\n"
+            "Akan berjalan 2-5 menit — ini normal, tunggu sampai return result."
         )
     )
 
@@ -88,38 +88,59 @@ EXTRACT:
   Returns: {{registered, total_in_registry, cache_hit, domain, sample}}
   Vendor OTOMATIS tersimpan di registry — tidak perlu dikumpulkan.
 
+ENRICHMENT:
+- enrich_vendors_parallel(max_concurrent=15, max_vendors=200):
+  Enrich semua vendor di registry dengan field yang kosong (website, email, phone, address, description, linkedin, twitter).
+  Berjalan PARALEL — 15 vendor diproses sekaligus via Firecrawl + OpenAI.
+  Otomatis: cari website → scrape halaman → LLM extract info kontak.
+  Returns: {{enriched, skipped, failed, elapsed_seconds, registry_total}}
+  PANGGIL SETELAH pengumpulan selesai, SEBELUM deduplicate + export.
+
 EXPORT:
 - deduplicate_vendors(): Hapus duplikat dari semua vendor di registry.
   PANGGIL TANPA ARGUMENT — otomatis deduplikasi seluruh registry.
   Returns: {{"original_count": N, "deduped_count": M, "message": "..."}}
   Registry diupdate otomatis dengan hasil dedup.
   WAJIB dijalankan sebelum export.
-- export_to_excel(query="..."): Export ke Excel file.
-  PANGGIL HANYA DENGAN query — vendor diambil otomatis dari registry.
-  query = query asli dari user (string).
+- export_to_excel(query="...", title="..."): Export ke Excel file.
+  query = query asli dari user.
+  title = nama file deskriptif 3-5 kata yang kamu buat sendiri sesuai konteks crawl.
+          Contoh: "Global_Defense_Security_Asia_2026", "DSEI_MSPO_Eurosatory_Exhibitors_2026",
+                  "Military_Defense_APAC_China_Russia_2026"
+          Gunakan underscore, tanpa extension. Buat nama yang informatif dan profesional.
   WAJIB dipanggil di akhir. Returns: path file Excel.
-- export_to_csv(query="..."): Export ke CSV file.
-  PANGGIL HANYA DENGAN query — vendor diambil otomatis dari registry.
-  query = query asli dari user (string).
+- export_to_csv(query="...", title="..."): Export ke CSV file.
+  Gunakan title yang SAMA dengan export_to_excel.
   Panggil bersamaan dengan export_to_excel.
 
-ALUR KERJA YANG DISARANKAN:
-1. Panggil search_exhibitor_events dengan query user untuk dapat seed URLs expo.
-2. Panggil fetch_pages_batch pada seed URLs terbaik (yang punya score tinggi).
-3. Untuk setiap URL yang sukses difetch (success=True):
-   a. Cek apakah URL adalah PDF → langsung panggil extract_vendors_from_pdf(url=URL_TERSEBUT).
-   b. Jika bukan PDF, coba run_extraction_pipeline(url=URL_TERSEBUT).
-   c. Jika hasilnya kosong atau confidence_score < 0.25, URL ini kemungkinan halaman LISTING.
-      → Panggil discover_vendor_urls(url=URL_TERSEBUT) untuk temukan profil vendor individual.
-      → Panggil fetch_pages_batch pada semua URL hasil discover_vendor_urls.
-      → Untuk setiap URL yang sukses difetch, panggil run_extraction_pipeline(url=...).
-   d. JANGAN kumpulkan vendor — semuanya otomatis masuk registry.
-4. Cek progress dengan get_vendor_count(). Jika masih < {max_vendors}: cari URL baru, ulang langkah 2-3.
-5. {enrich_instruction}
-6. Panggil deduplicate_vendors() — TANPA argument.
-7. Panggil export_to_excel(query="<query asli user>") — TANPA vendors argument.
-8. Panggil export_to_csv(query="<query asli user>") — TANPA vendors argument.
-9. Laporkan jumlah vendor final dan path file output.
+URUTAN WAJIB — JANGAN LEWATI SATU PUN:
+
+LANGKAH 1: KUMPULKAN VENDOR
+  a. Panggil search_exhibitor_events(query=...) untuk dapat seed URLs.
+  b. Panggil fetch_pages_batch pada seed URLs terbaik.
+  c. Untuk setiap URL sukses difetch:
+     - PDF → extract_vendors_from_pdf(url=...)  ← LANGSUNG, satu PDF bisa ratusan vendor
+     - Bukan PDF → run_extraction_pipeline(url=...)
+     - Return 0 vendor → generate_and_run_parser(url=...) → AI tulis parser khusus domain ini
+     - Masih 0 → discover_vendor_urls → fetch → ekstrak tiap profil individual
+  d. Cek: get_vendor_count(). Jika < {max_vendors} dan masih ada URL baru, ulangi dari (b).
+
+LANGKAH 2 — WAJIB — ENRICHMENT (JANGAN SKIP INI):
+  Panggil: enrich_vendors_parallel(max_concurrent=15, max_vendors=200)
+  Tool ini berjalan paralel — 15 vendor sekaligus. TUNGGU sampai selesai.
+  Dia akan: search website → Firecrawl scrape → LLM generate description + extract email/phone/linkedin.
+  China/Russia vendor → pakai OpenSERP Baidu/Yandex otomatis.
+  JANGAN lanjut ke langkah 3 sebelum enrichment selesai.
+
+LANGKAH 3: DEDUP
+  Panggil: deduplicate_vendors()
+
+LANGKAH 4: EXPORT
+  Panggil: export_to_excel(query="...", title="<3-5 kata deskriptif kamu buat sendiri>")
+  Panggil: export_to_csv(query="...", title="<sama dengan Excel>")
+
+LANGKAH 5: LAPORAN
+  Tulis ringkasan: jumlah vendor, field fill rate, path file.
 
 PENANGANAN PDF:
 - Kalau kamu menemukan link ke file PDF (URL berakhiran .pdf) yang terlihat seperti daftar exhibitor,
