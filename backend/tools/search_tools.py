@@ -1,5 +1,6 @@
 import time
 import random
+import re
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -21,6 +22,8 @@ _ENGINE_TIMEOUT: dict[str, int] = {
     "google":     45,
     "baidu":      90,
     "yandex":     90,
+    "yahoo":      45,   # Yahoo Japan — dominant in Japan
+    "naver":      45,   # Naver — dominant in South Korea
     "bing":       45,
     "duckduckgo": 45,
 }
@@ -61,7 +64,7 @@ CYBERSECURITY_EVENT_KEYWORDS = [
     "pentest", "red team", "blue team", "ciso",
 ]
 
-REGION_MAP = [
+_REGION_MAP_BASE = [
     {
         "keywords": ["china", "cina", "tiongkok", "beijing", "shanghai", "shenzhen", "guangzhou"],
         "engine": "baidu",
@@ -69,15 +72,15 @@ REGION_MAP = [
         "label": "China",
     },
     {
-        "keywords": ["jepang", "japan", "tokyo", "osaka", "kyoto"],
-        "engine": "google",
-        "extra_params": {"gl": "jp", "hl": "ja"},
+        "keywords": ["jepang", "japan", "tokyo", "osaka", "kyoto", "nagoya", "fukuoka"],
+        "engine": "yahoo",
+        "extra_params": {},
         "label": "Japan",
     },
     {
-        "keywords": ["korea", "korean", "seoul", "busan"],
-        "engine": "google",
-        "extra_params": {"gl": "kr", "hl": "ko"},
+        "keywords": ["korea", "korean", "seoul", "busan", "incheon", "daegu", "daejeon"],
+        "engine": "naver",
+        "extra_params": {},
         "label": "Korea",
     },
     {
@@ -157,6 +160,14 @@ REGION_MAP = [
         "label": "Asia",
     },
 ]
+
+def _get_shuffled_region_map() -> list[dict]:
+    """Shuffle region map to remove China-first bias. Return randomized copy."""
+    shuffled = list(_REGION_MAP_BASE)
+    random.shuffle(shuffled)
+    return shuffled
+
+REGION_MAP = _get_shuffled_region_map()
 
 GLOBAL_KEYWORDS = [
     "global", "worldwide", "world", "seluruh dunia", "all regions",
@@ -419,12 +430,19 @@ def search_exhibitor_events(query: str, max_seeds: int = 40) -> list[dict]:
     if n_regions <= 2:
         templates_to_use = SEARCH_TEMPLATES[:6]
         max_per_template = 15
+        dynamic_max_seeds = 40  # Single/dual region — conservative
     elif n_regions <= 5:
-        templates_to_use = SEARCH_TEMPLATES[:4]
-        max_per_template = 10
+        templates_to_use = SEARCH_TEMPLATES[:6]
+        max_per_template = 12
+        dynamic_max_seeds = 100  # Moderate multi-region
     else:
-        templates_to_use = SEARCH_TEMPLATES[:3]
-        max_per_template = 8
+        # Multi-region (6+): use more templates for comprehensive coverage
+        templates_to_use = SEARCH_TEMPLATES  # All 12 templates
+        max_per_template = 12
+        dynamic_max_seeds = 200  # Aggressive multi-region coverage
+
+    # Use dynamic seeds instead of hardcoded 40
+    effective_max_seeds = max(max_seeds, dynamic_max_seeds) if max_seeds > 0 else dynamic_max_seeds
 
     all_results: list[dict] = []
 
@@ -457,7 +475,7 @@ def search_exhibitor_events(query: str, max_seeds: int = 40) -> list[dict]:
 
     all_results = _deduplicate_urls(all_results)
     all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-    top_results = all_results[:max_seeds]
+    top_results = all_results[:effective_max_seeds]
 
     region_counts: dict[str, int] = {}
     for r in top_results:
@@ -507,22 +525,99 @@ def search_vendor_directory(
     return all_results[:30]
 
 
+def _engine_for_target(domain: str = "", country: str = "", name: str = "") -> tuple[str, dict]:
+    """
+    Pick the right search engine based on domain TLD, country, or company name.
+
+    Rules (checked in order of specificity):
+      • .cn / .com.cn TLD          → baidu  (China)
+      • .ru / .su TLD              → yandex (Russia)
+      • .jp TLD                    → google gl=jp hl=ja
+      • .kr TLD                    → google gl=kr hl=ko
+      • Chinese chars in name      → baidu
+      • Cyrillic chars in name     → yandex
+      • country keyword China/Russia → baidu/yandex
+      • everything else            → google (no geo params)
+
+    Returns (engine_name, extra_params_dict).
+    """
+    # ── TLD detection (most reliable signal) ─────────────────────────────────
+    tld = ""
+    if domain:
+        clean = domain.lower().replace("www.", "").rstrip("/")
+        # strip path/query if full URL was passed by mistake
+        tld = clean.split("/")[0].rsplit(".", 1)[-1]  # "cn", "ru", "jp", …
+
+    if tld in ("cn",) or ".com.cn" in domain.lower():
+        return "baidu", {}
+    if tld in ("ru", "su"):
+        return "yandex", {}
+    if tld == "jp":
+        return "yahoo", {}   # Yahoo Japan — far more relevant than Google for .jp domains
+    if tld == "kr":
+        return "naver", {}   # Naver — dominant Korean search engine
+
+    # ── Script detection in company name ─────────────────────────────────────
+    if name:
+        has_cjk = any('\u4e00' <= c <= '\u9fff' for c in name)
+        has_cyrillic = any('\u0400' <= c <= '\u04ff' for c in name)
+        if has_cjk:
+            return "baidu", {}
+        if has_cyrillic:
+            return "yandex", {}
+
+    # ── Country / name keyword fallback ──────────────────────────────────────
+    _CN_KEYWORDS = (
+        "china", "chinese", "prc", "beijing", "shanghai", "shenzhen",
+        "guangzhou", "chengdu", "wuhan", "tianjin", "hangzhou", "nanjing",
+        "qingdao", "xi'an", "xian", "chongqing", "dalian", "suzhou",
+    )
+    _RU_KEYWORDS = (
+        "russia", "russian", "moscow", "moskow", "st. petersburg",
+        "saint petersburg", "novosibirsk", "ekaterinburg",
+    )
+    _JP_KEYWORDS = (
+        "japan", "japanese", "tokyo", "osaka", "kyoto", "nagoya",
+        "fukuoka", "sapporo", "kobe", "hiroshima",
+    )
+    _KR_KEYWORDS = (
+        "korea", "korean", "south korea", "seoul", "busan",
+        "incheon", "daegu", "daejeon", "gwangju",
+    )
+    combined = (country + " " + name).lower()
+    if any(kw in combined for kw in _CN_KEYWORDS):
+        return "baidu", {}
+    if any(kw in combined for kw in _RU_KEYWORDS):
+        return "yandex", {}
+    if any(kw in combined for kw in _JP_KEYWORDS):
+        return "yahoo", {}
+    if any(kw in combined for kw in _KR_KEYWORDS):
+        return "naver", {}
+
+    return "google", {}
+
+
 @tool
-def search_company_info(company_name: str, domain: str = "") -> dict:
+def search_company_info(company_name: str, domain: str = "", country: str = "") -> dict:
     """
     Search for basic info about a specific company. Used during enrichment phase.
+    Automatically selects the right search engine based on domain TLD, country,
+    or script in company name (Baidu for China, Yandex for Russia, Google otherwise).
     Returns structured info: website, linkedin, description, country.
     """
+    engine, extra_params = _engine_for_target(domain=domain, country=country, name=company_name)
+    logger.debug(f"[SEARCH-CO] {company_name!r} domain={domain!r} → engine={engine}")
+
     queries = [
         f'"{company_name}" official website',
-        f'"{company_name}" company cybersecurity defense',
+        f'"{company_name}" company',
     ]
     if domain:
         queries.insert(0, f"site:{domain} {company_name}")
 
     results: list[dict] = []
     for q in queries[:2]:
-        r = _openserp_search("google", q, limit=5)
+        r = _openserp_search(engine, q, limit=5, extra_params=extra_params)
         results.extend(r)
         time.sleep(0.3)
 

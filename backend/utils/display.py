@@ -44,7 +44,13 @@ THEME = {
     "vendor_category": "magenta",
 }
 
-console = Console(highlight=False)
+import sys as _sys, io as _io
+if hasattr(_sys.stdout, "buffer"):
+    _sys.stdout = _io.TextIOWrapper(_sys.stdout.buffer, encoding="utf-8", errors="replace")
+if hasattr(_sys.stderr, "buffer"):
+    _sys.stderr = _io.TextIOWrapper(_sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+console = Console(highlight=False, force_terminal=True)
 
 
 def _safe(text: str, max_len: int = 60) -> str:

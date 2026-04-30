@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     openhands_parser_enabled: bool = Field(default=True)
     openhands_parser_model: str = Field(default="gpt-4o-mini", description="Model khusus untuk generate parser code")
 
-    min_vendor_fields: int = Field(default=3, description="Min fields for rule-based to be considered success")
+    min_vendor_fields: int = Field(default=7, description="Min fields for extraction to be considered success (raised from 3 to avoid accepting incomplete vendors)")
     vendor_dedup_fields: list[str] = Field(default=["name", "website"])
     max_vendors_per_event: int = Field(default=2000)
     max_total_vendors: int = Field(default=10000)

@@ -169,6 +169,7 @@ def _build_worker_prompt(url: str, event_context: dict, max_per_worker: int = 0)
     event_name = event_context.get("event_name", "unknown event")
     event_location = event_context.get("event_location", "")
     event_date = event_context.get("event_date", "")
+    url_domain = _domain_of(url)
 
     limit_line = (
         f"\nBATAS VENDOR URL INI: {max_per_worker} vendor. "
@@ -188,86 +189,109 @@ VENDOR REGISTRY: Semua vendor yang diekstrak OTOMATIS tersimpan di registry inte
 Gunakan get_vendor_count() untuk memantau progress.
 
 ═══════════════════════════════════════════════════════
-LOOP PERILAKU WAJIB
+STRATEGI EKSTRAKSI (IKUTI URUTAN INI!)
 ═══════════════════════════════════════════════════════
 
-LANGKAH 1 — FETCH & EVALUASI:
-  fetch_page(url) → lihat hasilnya
+LANGKAH 1 — FETCH HALAMAN:
+  fetch_page(url) → lihat apakah ini halaman daftar exhibitor.
 
-  Jika halaman 404 / About / Kontak / bukan exhibitor:
-    → Lihat link navigasi di halaman (biasanya ada di nav/header)
-    → Coba path yang sering ada di situs event:
-        /exhibitors, /exhibitor-list, /exhibitors-directory
-        /companies, /participants, /vendors, /directory
-        /ExhibitorFiles, /brand, /sponsors, /members, /showfloor
-    → Jika tidak ketemu: pakai search_company_info untuk cari di domain ini
-      Contoh: search_company_info(name="site:domain.com exhibitor list 2026", country="")
-    → fetch_page() pada URL kandidat → evaluasi lagi
+  Jika bukan halaman daftar (404 / About / Contact / bukan listing):
+    → Coba path umum situs event:
+        /exhibitors, /exhibitor-list, /participants, /companies, /directory
+        /vendors, /brand, /sponsors, /members, /showfloor, /katilimcilar
+    → fetch_page(kandidat) → evaluasi lagi
+    → Jika tidak ketemu: search_company_info(name="site:{url_domain} exhibitor list", country="")
+    → fetch_page(hasil search) → evaluasi
 
-  Jika halaman daftar exhibitor DITEMUKAN:
-    → Lanjut ke LANGKAH 2
+LANGKAH 2 ★ PATH UTAMA — EXTRACT LANGSUNG DARI LISTING:
+  ★★★ GUNAKAN INI SEBAGAI LANGKAH PERTAMA setelah menemukan halaman listing! ★★★
 
-LANGKAH 2 — EKSTRAK SEMUA DARI HALAMAN LISTING:
-  a. discover_vendor_urls(url=..., max_urls=200)
-     → Dapat list URL profil vendor/exhibitor
-  b. LANGSUNG panggil SATU KALI (JANGAN loop run_extraction_pipeline!):
-       extract_all_vendor_profiles(
-           vendor_urls=[...semua URL dari langkah a...],
-           event_context='{{"event_name":"..."}}',
-           max_concurrent=8
+  extract_vendors_from_listing(
+      url=<url halaman listing>,
+      event_context='{{"event_name":"{event_name}","event_location":"{event_location}","event_date":"{event_date}"}}'
+  )
+  Tool ini:
+  • Jina AI Reader → otomatis render JavaScript (React/Vue/Angular tidak masalah!)
+  • LLM ekstrak SEMUA exhibitor dari halaman sekaligus (bukan satu-satu)
+  • Kuliti semuanya: booth_number, pavilion, country, products, dll — tidak ada schema tetap
+  • Jauh lebih efektif dari discover_vendor_urls → extract_all_vendor_profiles
+
+  Lihat return: vendors_found=N
+  Jika N > 0 → sukses! Lanjut ke LANGKAH 3 (pagination).
+  Jika vendors_found=0 (Jina gagal/rate limit/diblokir) → LANGSUNG ke LANGKAH 2B.
+  JANGAN coba extract_vendors_from_listing berkali-kali pada URL berbeda kalau sudah 429!
+
+LANGKAH 2B — SEARCH DULU kalau Jina gagal:
+  Jika extract_vendors_from_listing gagal (error/vendors_found=0):
+  a. Cari halaman exhibitor via search:
+       search_company_info(
+           name="site:{url_domain} exhibitor list OR participants OR peserta 2025 2026",
+           country=""
        )
-     Tool ini:
-     • Fetch semua URL PARALEL (jauh lebih cepat dari satu-satu)
-     • Gunakan LLM untuk SETIAP halaman: "ini vendor beneran atau bukan?"
-     • Otomatis skip halaman kategori/navigasi/berita (tidak masuk registry)
-     • 1 tool call ini menggantikan 20+ run_extraction_pipeline() calls
+     → Ambil URL paling relevan dari hasil search
+     → fetch_page(url_hasil_search)
+     → extract_vendors_from_listing(url_hasil_search, event_context=...)
+  b. Atau coba path umum langsung (TANPA Jina dulu, pakai fetch_page biasa):
+       Coba: /exhibitors, /participants, /directory, /companies, /vendors
+       fetch_page(kandidat) → kalau dapat HTML dengan banyak nama perusahaan →
+       extract_vendors_from_listing(kandidat, event_context=...)
 
-     BACKUP — gunakan run_extraction_pipeline(url=...) HANYA untuk:
-     • 1-2 URL spesifik yang perlu dicek manual
-     • URL yang di-skip oleh extract_all_vendor_profiles tapi kamu yakin itu vendor
+LANGKAH 3 — KEJAR SEMUA PAGINATION (WAJIB!):
+  Setelah setiap halaman, cek pagination:
+  check_pagination(url=<url halaman yang baru diproses>)
 
-  c. check_pagination(url=...) → lihat apakah ada halaman berikutnya
-     Jika next_url ada:
-       → fetch_page(next_url)
-       → Ulangi langkah 2 untuk next_url
-       → Terus sampai check_pagination return next_url KOSONG
-     Jika needs_click=True (tombol JS):
-       → click_and_extract(url=..., selector=...)
-       → discover_vendor_urls lagi untuk konten baru
-  d. Jika site terlihat JS-heavy / React / Vue:
-     → intercept_api_vendors(url=...) untuk intersep XHR API call
+  Jika next_url ada:
+    → fetch_page(next_url)
+    → extract_vendors_from_listing(url=next_url, event_context=...)
+    → Ulangi check_pagination untuk next_url berikutnya
+    → Terus sampai next_url KOSONG
 
-LANGKAH 3 — CEK & ULANGI:
-  get_vendor_count() → cek progress
-  Jika masih ada pagination / belum semua halaman diproses → ulangi langkah 2
+  Jika needs_click=True (tombol Load More / See More):
+    → click_and_extract(url=..., selector=...)
+    → extract_vendors_from_listing(url=..., event_context=...) lagi pada konten baru
 
-LANGKAH 4 — SELESAI:
-  BERHENTI hanya jika SEMUA kondisi terpenuhi:
-  ✓ check_pagination() return next_url kosong DAN needs_click=False
-  ✓ Tidak ada "Load More" yang belum diklik
-  ✓ Sudah mencoba semua path relevan di domain ini
-  ✓ Minimal sudah 1 halaman listing diproses
+LANGKAH 4 — FALLBACK TERAKHIR (hanya jika semua di atas gagal):
+  a. Coba intercept API: intercept_api_vendors(url=...) → untuk SPA yang pakai XHR
+  b. Coba discover profil individual (HANYA jika Jina tidak rate-limited):
+       discover_vendor_urls(url=..., max_urls=200)
+       → Jika dapat ≥5 URL profil yang JELAS exhibitor (bukan about/joinus/culture/dll):
+         extract_all_vendor_profiles(vendor_urls=[...], event_context=..., max_concurrent=8)
+       → JANGAN panggil ini untuk URL navigasi/junk!
+
+  ⚠ PERINGATAN: Jika Jina sudah return 429 (rate limit), BERHENTI panggil Jina!
+     Gunakan search_company_info untuk cari alternatif, bukan brute-force Jina.
+
+LANGKAH 5 — SELESAI:
+  get_vendor_count() → laporan final
+  BERHENTI hanya jika:
+  ✓ Semua halaman listing sudah diproses via extract_vendors_from_listing
+  ✓ Semua pagination sudah diikuti (check_pagination return kosong)
+  ✓ Tidak ada Load More yang tersisa
 
 ═══════════════════════════════════════════════════════
 TOOLS YANG TERSEDIA
 ═══════════════════════════════════════════════════════
 - fetch_page(url): Fetch satu halaman, simpan ke cache
 - fetch_pages_batch(urls): Fetch BANYAK halaman PARALEL sekaligus → lebih cepat
-- check_pagination(url): Cari next page URL atau Load More selector (dari cache)
+- extract_vendors_from_listing(url, event_context):
+    ★★★ PRIMARY EXTRACTOR ★★★ — Jina + LLM, ekstrak SEMUA vendor dari listing page
+    Otomatis render JavaScript. Kuliti semuanya — tidak ada schema tetap.
+    SELALU coba ini PERTAMA pada setiap halaman listing!
+- check_pagination(url): Cari next page URL atau Load More selector
+- click_and_extract(url, selector): Klik Load More → update HTML cache
 - intercept_api_vendors(url): Intersep XHR/API vendor di halaman SPA
 - extract_all_vendor_profiles(vendor_urls, event_context, max_concurrent=8):
-    ★ PRIMARY EXTRACTOR ★ — paralel + LLM sebagai validator & extractor
-    Proses banyak URL sekaligus, skip non-vendor otomatis. SELALU gunakan ini!
-- run_extraction_pipeline(url): Backup — ekstrak satu URL spesifik saja
-- discover_vendor_urls(url, max_urls=200): Temukan semua URL profil vendor di halaman listing
+    FALLBACK — untuk situs yang punya URL profil individual per vendor
+- run_extraction_pipeline(url): Fallback terakhir — satu URL spesifik
+- discover_vendor_urls(url, max_urls=200): Temukan URL profil individual di halaman listing
 - get_vendor_count(): Cek total vendor di registry
-- search_company_info(name, country): Cari info/URL perusahaan via search engine
-- click_and_extract(url, selector): Klik Load More → update HTML cache
+- search_company_info(name, country): Cari info/URL via search engine
 
 PERINGATAN KERAS:
-- JANGAN berhenti setelah 1-2 halaman. Kejar semua pagination!
-- JANGAN export atau dedup — itu tugas orchestrator, bukan kamu
-- JANGAN pass vendor list — semua otomatis ke registry
+- JANGAN berhenti setelah 1 halaman — kejar SEMUA pagination!
+- JANGAN gunakan run_extraction_pipeline pada listing page (akan ekstrak organizer, bukan exhibitor!)
+- JANGAN export atau dedup — itu tugas orchestrator
+- JANGAN pass vendor list ke LLM — semua otomatis ke registry
 - Kamu punya 10 menit. Manfaatkan sepenuhnya!
 """
 
@@ -298,6 +322,7 @@ class _URLWorkerAgent:
             discover_vendor_urls,
             run_extraction_pipeline,
             extract_all_vendor_profiles,
+            extract_vendors_from_listing,
         )
         from backend.tools.parse_tools import intercept_api_vendors
         from backend.tools.search_tools import search_company_info
@@ -305,11 +330,12 @@ class _URLWorkerAgent:
 
         worker_tools = [
             fetch_page,
-            fetch_pages_batch,         # batch-fetch before extraction (speed)
+            fetch_pages_batch,              # batch-fetch before extraction (speed)
             check_pagination,
             intercept_api_vendors,
-            extract_all_vendor_profiles,   # PRIMARY: parallel LLM extraction
-            run_extraction_pipeline,       # BACKUP: single-URL fallback
+            extract_vendors_from_listing,   # ★ PRIMARY: Jina+LLM batch listing extractor
+            extract_all_vendor_profiles,    # FALLBACK: parallel LLM on individual profile URLs
+            run_extraction_pipeline,        # LAST RESORT: single-URL fallback
             discover_vendor_urls,
             get_vendor_count,
             search_company_info,

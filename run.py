@@ -47,7 +47,7 @@ Examples:
     parser.add_argument(
         "--no-enrich",
         action="store_true",
-        help="Skip the domain enrichment phase (faster, less data)",
+        help="[DEPRECATED] Enrichment is now mandatory. This flag is ignored.",
     )
     parser.add_argument(
         "--no-llm",
@@ -164,7 +164,7 @@ def main() -> int:
         return 1
 
     print_info("CONFIG", f"model={settings.openai_model}  max_vendors={settings.max_total_vendors}")
-    print_info("CONFIG", f"enrich={'off' if args.no_enrich else 'on'}")
+    print_info("CONFIG", f"enrich=on (mandatory)")
     pdf_parser = "Firecrawl ✅" if settings.has_firecrawl_key else ("Jina ✅ (free)" if True else "")
     print_info("CONFIG", f"tavily={'✅' if settings.tavily_api_key else '❌'}  pdf={pdf_parser}  jina={'✅ (key)' if settings.has_jina_key else '✅ (free)'}  llm={'✅' if settings.effective_llm_enabled else '❌'}")
     print_info("CONFIG", f"output={settings.output_path}")
@@ -177,7 +177,7 @@ def main() -> int:
         result = run_crawler(
             args.query,
             max_vendors=settings.max_total_vendors,
-            skip_enrich=args.no_enrich,
+            skip_enrich=False,  # Enrichment is now mandatory, --no-enrich flag ignored
         )
 
     except KeyboardInterrupt:

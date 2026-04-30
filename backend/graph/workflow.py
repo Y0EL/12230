@@ -86,6 +86,13 @@ def _summarize_tool_output(name: str, output: Any) -> str:
         return f"{len(output)} item"
     if isinstance(output, dict):
         # Registry-pattern tool summaries
+        if "vendors_found" in output and "total_in_registry" in output:
+            # extract_vendors_from_listing summary
+            return (
+                f"vendors_found={output['vendors_found']}  "
+                f"registry_total={output['total_in_registry']}  "
+                f"is_listing={output.get('is_listing_page', '?')}"
+            )
         if "total_in_registry" in output:
             return f"registered={output.get('registered', '?')}  registry_total={output['total_in_registry']}"
         if "deduped_count" in output:
@@ -140,6 +147,7 @@ _TOP_LEVEL_TOOLS = {
     "search_exhibitor_events", "search_vendor_directory", "search_company_info",
     "fetch_page", "fetch_pages_batch", "check_robots_txt", "resolve_final_url",
     "run_extraction_pipeline", "extract_all_vendor_profiles",
+    "extract_vendors_from_listing",
     "discover_vendor_urls", "extract_vendors_from_pdf",
     "get_vendor_count", "generate_and_run_parser", "enrich_vendors_parallel",
     "deduplicate_vendors", "export_to_excel", "export_to_csv", "export_to_json",
@@ -196,7 +204,8 @@ async def _run_async(query: str, max_vendors: int, skip_enrich: bool) -> dict:
 
     _settings.max_total_vendors = max_vendors
 
-    system_prompt = build_system_prompt(max_vendors=max_vendors, skip_enrich=skip_enrich)
+    # Always enable enrichment (no opt-out) to ensure complete vendor data
+    system_prompt = build_system_prompt(max_vendors=max_vendors, skip_enrich=False)
     agent = build_react_agent(system_prompt=system_prompt)
     result: dict = {"vendors": [], "output_excel": "", "output_csv": "", "output_json": ""}
 

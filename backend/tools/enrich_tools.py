@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import re
 import time
 from urllib.parse import urlparse
@@ -55,22 +56,71 @@ def _is_skip_domain(url: str) -> bool:
         return False
 
 
-async def _search_company(name: str, country: str = "", is_cn_ru: bool = False) -> tuple[str, str]:
+def _engine_for_vendor(vendor: dict) -> str:
+    """
+    Pick the right OpenSERP engine for a vendor based on country, name, domain.
+    Priority: TLD → script detection → country/city keyword.
+    """
+    from urllib.parse import urlparse as _up
+
+    # TLD check from website / source_url
+    for field in ("website", "source_url"):
+        url = (vendor.get(field) or "").strip()
+        if url:
+            try:
+                tld = _up(url).netloc.lower().replace("www.", "").rsplit(".", 1)[-1]
+                if tld == "cn" or ".com.cn" in url.lower():
+                    return "baidu"
+                if tld in ("ru", "su"):
+                    return "yandex"
+                if tld == "jp":
+                    return "yahoo"
+                if tld == "kr":
+                    return "naver"
+            except Exception:
+                pass
+
+    name = vendor.get("name") or ""
+    country = (vendor.get("country") or "").lower()
+    combined = (country + " " + name).lower()
+
+    # Script detection in company name
+    if any('\u4e00' <= c <= '\u9fff' for c in name):
+        return "baidu"
+    if any('\u0400' <= c <= '\u04ff' for c in name):
+        return "yandex"
+    if any('\u3040' <= c <= '\u30ff' for c in name):   # Hiragana / Katakana
+        return "yahoo"
+    if any('\uac00' <= c <= '\ud7a3' for c in name):   # Hangul
+        return "naver"
+
+    # Country / city keywords
+    if any(k in combined for k in ("china","chinese","prc","beijing","shanghai","shenzhen","guangzhou")):
+        return "baidu"
+    if any(k in combined for k in ("russia","russian","moscow","moskow")):
+        return "yandex"
+    if any(k in combined for k in ("japan","japanese","tokyo","osaka","kyoto","nagoya")):
+        return "yahoo"
+    if any(k in combined for k in ("korea","korean","seoul","busan","incheon")):
+        return "naver"
+
+    return "google"
+
+
+async def _search_company(name: str, country: str = "", vendor: dict | None = None) -> tuple[str, str]:
     """
     Returns (best_url, snippet_text).
-    Search order: OpenSERP (Google/Baidu/Yandex) → Tavily → DuckDuckGo.
-    All three are tried until one returns a usable result.
+    Picks the right engine per vendor region:
+      China  → Baidu  |  Russia → Yandex
+      Japan  → Yahoo  |  Korea  → Naver  |  else → Google
+    Search order: OpenSERP → Tavily → DuckDuckGo.
     """
     settings = get_settings()
     query = f"{name} {country} official website contact"
 
-    # ── 1. OpenSERP ─────────────────────────────────────────────────────────
+    # ── 1. OpenSERP — region-aware engine ────────────────────────────────────
     if settings.openserp_enabled:
-        # CN/RU → Baidu/Yandex; everyone else → Google
-        if is_cn_ru:
-            engine = "baidu" if "china" in country.lower() else "yandex"
-        else:
-            engine = "google"
+        engine = _engine_for_vendor(vendor or {"name": name, "country": country})
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 r = await client.get(
@@ -217,7 +267,7 @@ async def _enrich_with_llm(vendor: dict, content: str) -> dict:
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
-            max_tokens=400,
+            max_completion_tokens=400,
         )
         if supports_temp:
             kwargs["temperature"] = 0.0
@@ -235,9 +285,65 @@ def _needs_enrichment(v: dict) -> bool:
 
 
 def _is_china_russia(v: dict) -> bool:
-    c = (v.get("country") or "").lower()
-    n = (v.get("name") or "").lower()
-    return any(kw in c or kw in n for kw in ("china", "russia", "chinese", "russian", "beijing", "moscow"))
+    """
+    Return True if the vendor is likely Chinese or Russian, based on:
+      1. Domain TLD  (.cn → China, .ru → Russia) — most reliable
+      2. Country field keywords
+      3. Name field keywords or CJK/Cyrillic script
+    """
+    from urllib.parse import urlparse as _urlparse
+
+    # ── 1. TLD check ─────────────────────────────────────────────────────────
+    for field in ("website", "source_url"):
+        url = (v.get(field) or "").strip()
+        if url:
+            try:
+                tld = _urlparse(url).netloc.lower().replace("www.", "").rsplit(".", 1)[-1]
+                if tld == "cn" or ".com.cn" in url.lower():
+                    return True
+                if tld in ("ru", "su"):
+                    return True
+            except Exception:
+                pass
+
+    _CN_KWS = (
+        "china", "chinese", "prc", "beijing", "shanghai", "shenzhen",
+        "guangzhou", "chengdu", "wuhan", "tianjin", "hangzhou", "nanjing",
+        "qingdao", "xian", "xi'an", "chongqing", "dalian", "suzhou",
+    )
+    _RU_KWS = (
+        "russia", "russian", "moscow", "moskow", "st. petersburg",
+        "saint petersburg", "novosibirsk",
+    )
+
+    # ── 2. Country keyword ────────────────────────────────────────────────────
+    country = (v.get("country") or "").lower()
+    if any(kw in country for kw in _CN_KWS):
+        return True
+    if any(kw in country for kw in _RU_KWS):
+        return True
+
+    # ── 3. Name script / keyword ──────────────────────────────────────────────
+    name = (v.get("name") or "")
+    if any('\u4e00' <= c <= '\u9fff' for c in name):   # CJK characters
+        return True
+    if any('\u0400' <= c <= '\u04ff' for c in name):   # Cyrillic characters
+        return True
+    name_lower = name.lower()
+    if any(kw in name_lower for kw in _CN_KWS):
+        return True
+    if any(kw in name_lower for kw in _RU_KWS):
+        return True
+
+    # ── 4. Address / city field ───────────────────────────────────────────────
+    for field in ("city", "address"):
+        val = (v.get(field) or "").lower()
+        if any(kw in val for kw in _CN_KWS):
+            return True
+        if any(kw in val for kw in _RU_KWS):
+            return True
+
+    return False
 
 
 def _is_readable(s: str) -> bool:
@@ -297,7 +403,7 @@ def _clean_field(v: str, field: str = "") -> str:
 
 def _merge(vendor: dict, extracted: dict) -> dict:
     allowed = {"website", "email", "phone", "address", "city", "description",
-               "linkedin", "twitter", "category"}
+               "linkedin", "twitter", "category", "company_size", "founded_year"}
     updated = dict(vendor)
     # Clean existing fields that may contain garbage from prior extraction
     for k in list(updated.keys()):
@@ -318,10 +424,10 @@ async def _enrich_one(vendor: dict, sem: asyncio.Semaphore) -> dict:
     async with sem:
         name = vendor.get("name", "")
         website = vendor.get("website", "")
-        is_cn_ru = _is_china_russia(vendor)
 
         # Step 1: find website + get search snippet
-        url, snippet = await _search_company(name, vendor.get("country", ""), is_cn_ru)
+        # _search_company picks the right engine per region automatically
+        url, snippet = await _search_company(name, vendor.get("country", ""), vendor)
         if url and not website:
             vendor = dict(vendor, website=url)
             website = url
@@ -358,11 +464,10 @@ def enrich_vendors_parallel(max_concurrent: int = 15, max_vendors: int = 10_000)
     """
     async def _run():
         vendors = get_all_vendors()
-        # Prioritize: most empty fields first, China/Russia vendors get priority
-        needs = sorted(
-            [v for v in vendors if _needs_enrichment(v)],
-            key=lambda v: (_is_china_russia(v) * -1, -sum(1 for f in ("website","email","phone","description","linkedin") if not v.get(f)))
-        )[:max_vendors]
+        # Collect vendors needing enrichment (no geographic priority to avoid bias)
+        needs = [v for v in vendors if _needs_enrichment(v)][:max_vendors]
+        # Shuffle to randomize processing order (fair treatment across regions)
+        random.shuffle(needs)
 
         skip_count = len(vendors) - len(needs)
         if not needs:
@@ -370,7 +475,7 @@ def enrich_vendors_parallel(max_concurrent: int = 15, max_vendors: int = 10_000)
                     "elapsed_seconds": 0, "registry_total": get_count(),
                     "message": "All vendors already enriched"}
 
-        logger.info(f"[ENRICH] {len(needs)} vendors to enrich ({max_concurrent} parallel) — {sum(1 for v in needs if _is_china_russia(v))} China/Russia via OpenSERP")
+        logger.info(f"[ENRICH] {len(needs)} vendors to enrich ({max_concurrent} parallel, randomized order)")
         t0 = time.time()
 
         sem = asyncio.Semaphore(max_concurrent)

@@ -20,7 +20,8 @@ from loguru import logger
 _CORE_FIELDS = ["email", "phone", "website", "linkedin", "description"]
 _ALL_FIELDS  = ["email", "phone", "website", "linkedin", "twitter",
                 "description", "address", "city", "category",
-                "specialized", "products", "certifications"]
+                "specialized", "products", "certifications",
+                "company_size", "founded_year"]
 
 _WS_MODEL = "gpt-5-nano"   # cheapest, user-mandated
 
@@ -100,7 +101,9 @@ def _build_prompt(vendor: dict, ddgs_url: str, ddgs_context: str) -> str:
         f'"category":"industry category","specialized":"products or specialization",'
         f'"description":"1-2 sentence company profile",'
         f'"email":"contact email","phone":"phone number",'
-        f'"linkedin":"LinkedIn URL","city":"city"}}\n'
+        f'"linkedin":"LinkedIn URL","city":"city",'
+        f'"company_size":"number of employees or size category (e.g., SME, 50-100, 1000+)",'
+        f'"founded_year":"year company was founded (integer, e.g., 2015)"}}\n'
         f"Missing fields to find: {', '.join(missing)}\n"
         f"NO explanation. PURE JSON only."
     )

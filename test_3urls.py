@@ -79,7 +79,7 @@ async def run_test():
     from backend.tools.url_worker import crawl_urls_parallel
     from backend.tools.enrich_tools import enrich_vendors_parallel
     from backend.tools.export_tools import (
-        export_to_excel, export_to_csv, export_to_json, deduplicate_vendors,
+        export_to_json, deduplicate_vendors,
     )
 
     # ── Clean state ───────────────────────────────────────────────────────────
@@ -188,19 +188,11 @@ async def run_test():
     print_vendor_preview_table(get_all_vendors(), max_rows=15)
 
     # ════════════════════════════════════════════════════════════════
-    # STEP 3 — EXPORT
+    # STEP 3 — EXPORT (JSON only)
     # ════════════════════════════════════════════════════════════════
     console.print(Rule("[bold cyan]STEP 4 — EXPORT[/bold cyan]", style="dim blue"))
     query_label = "Security China + Interpolitex + Gartner Security test"
     title_label = "3-Region Security Expo Test"
-
-    print_tool_start("export_to_excel", {"query": query_label, "title": title_label})
-    excel_path = export_to_excel.invoke({"query": query_label, "title": title_label})
-    print_tool_end("export_to_excel", excel_path or "failed")
-
-    print_tool_start("export_to_csv", {"query": query_label, "title": title_label})
-    csv_path = export_to_csv.invoke({"query": query_label, "title": title_label})
-    print_tool_end("export_to_csv", csv_path or "failed")
 
     print_tool_start("export_to_json", {"query": query_label, "title": title_label})
     json_path = export_to_json.invoke({"query": query_label, "title": title_label})
@@ -219,10 +211,6 @@ async def run_test():
         f"[bold white]{final_count}[/bold white] vendors  ·  "
         f"[dim]{total_elapsed}s total[/dim]\n"
     )
-    if excel_path:
-        console.print(f"  [bold cyan]Excel :[/bold cyan] {excel_path}")
-    if csv_path:
-        console.print(f"  [bold cyan]CSV   :[/bold cyan] {csv_path}")
     if json_path:
         console.print(f"  [bold cyan]JSON  :[/bold cyan] {json_path}")
     console.print()

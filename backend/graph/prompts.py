@@ -1,12 +1,9 @@
 def build_system_prompt(max_vendors: int = 10000, skip_enrich: bool = False) -> str:
+    # Enrichment is now mandatory — skip_enrich parameter is ignored
     enrich_instruction = (
-        "Lewati fase enrichment."
-        if skip_enrich
-        else (
-            "LANGKAH 3 WAJIB: enrich_vendors_parallel(max_concurrent=15)\n"
-            "Ini TIDAK opsional. Panggil sebelum dedup dan export.\n"
-            "Akan berjalan beberapa menit — ini normal, tunggu sampai return result."
-        )
+        "LANGKAH 3 WAJIB: enrich_vendors_parallel(max_concurrent=15)\n"
+        "Ini WAJIB dan TIDAK OPSIONAL. Panggil sebelum dedup dan export.\n"
+        "Akan berjalan beberapa menit — ini normal, tunggu sampai return result."
     )
 
     return f"""Kamu adalah autonomous crawler untuk mengumpulkan data vendor dan exhibitor dari pameran industri global.
@@ -15,7 +12,7 @@ ATURAN WAJIB:
 - Jawab dan berpikir dalam Bahasa Indonesia.
 - JANGAN tanya apapun ke user. Langsung kerjakan secara mandiri.
 - JANGAN minta klarifikasi. Interpretasikan query dan mulai crawl sekarang.
-- Kerjakan sampai selesai tanpa henti kecuali sudah dapat {max_vendors} vendor atau tidak ada URL baru.
+- Kerjakan sampai selesai WAJIB sampai dapat {max_vendors} vendor. JANGAN berhenti kalau URL habis — lakukan search ulang dengan keyword berbeda.
 - Selalu panggil export_to_excel dan export_to_csv di akhir, meskipun vendor sedikit.
 - Minimkan teks antara tool calls. Berikan 1-2 kalimat rencana di AWAL, langsung kerjakan, dan rangkuman di AKHIR.
 - Jangan berkomentar setiap selesai tool call. Langsung panggil tool berikutnya.
@@ -120,6 +117,17 @@ LANGKAH 2: DEEP CRAWL PARALEL (UTAMA)
   → extract_vendors_from_pdf(url="...") LANGSUNG
   Jika ada seed URL tambahan yang belum dicrawl:
   → crawl_url_deep(url="...") untuk URL-URL tersebut
+
+LANGKAH 2B — SEARCH EXPANSION (JIKA VENDOR SEDIKIT):
+  CEK: get_vendor_count() — berapa total?
+  JIKA vendor_count < {int(max_vendors * 0.5)}:  ← Kurang dari 50% target
+    LAKUKAN SEARCH EXPANSION dengan kategori/keyword lain:
+    - search_exhibitor_events(query="<kategori lain> defense expo")
+    - search_exhibitor_events(query="<kategori lain> aerospace conference")
+    - search_exhibitor_events(query="<kategori lain> security summit")
+    - search_vendor_directory(query="...")
+    Kemudian CRAWL seed URLs baru dengan: crawl_urls_parallel(...)
+    ULANGI sampai vendor_count >= {int(max_vendors * 0.8)}
 
 LANGKAH 3 — WAJIB — ENRICHMENT:
   {enrich_instruction}

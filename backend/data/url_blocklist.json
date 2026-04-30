@@ -1,0 +1,4 @@
+{
+  "_comment": "Auto-generated URL path pattern blocklist. Patterns here are skipped in discover_vendor_urls().",
+  "blocked_path_patterns": []
+}

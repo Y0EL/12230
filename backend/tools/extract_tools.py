@@ -1,9 +1,11 @@
 import asyncio
 import re
 import json
+import xml.etree.ElementTree as ET
 from typing import Optional, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, urlencode, parse_qs, urlunparse
 
+import httpx
 import tldextract
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
@@ -504,6 +506,55 @@ def _count_populated(data: dict) -> int:
     return sum(1 for f in core_fields if data.get(f))
 
 
+_JUNK_DESC_KEYWORDS = [
+    "make an appointment", "book an appointment", "book a meeting",
+    "book a demo", "request a demo", "apply to exhibit",
+    "exhibit with us", "register to exhibit", "sign up to exhibit",
+    "apply for a booth", "apply booth", "register booth",
+    "schedule a visit", "schedule a demo", "fill out the form",
+    "complete your registration", "reserve your spot",
+]
+
+
+def _compute_confidence(vendor: dict) -> float:
+    """
+    Compute an honest confidence score for a vendor record.
+
+    Hard gates (applied first):
+      • No name → 0.0 immediately
+      • No contact info (email, phone, or website) → cap at 0.35
+
+    Penalties (applied to baseline after gates):
+      • Description contains junk marketing / booking keywords → −0.20
+      • Description shorter than 50 chars → −0.10
+
+    Baseline: populated_core_fields / 9.0
+    """
+    name = (vendor.get("name") or "").strip()
+    if not name:
+        return 0.0
+
+    # Baseline from populated core fields
+    core_fields = ["name", "website", "email", "phone", "address", "city", "country", "description", "category"]
+    populated = sum(1 for f in core_fields if vendor.get(f))
+    score = populated / 9.0
+
+    # Hard gate: must have at least one contact signal
+    has_contact = bool(vendor.get("email") or vendor.get("phone") or vendor.get("website"))
+    if not has_contact:
+        score = min(score, 0.35)
+
+    # Junk description penalty
+    desc = (vendor.get("description") or "").lower()
+    if desc:
+        if any(kw in desc for kw in _JUNK_DESC_KEYWORDS):
+            score -= 0.20
+        if len(desc) < 50:
+            score -= 0.10
+
+    return round(max(0.0, min(score, 1.0)), 3)
+
+
 # ── Private helper implementations ───────────────────────────────────────────
 
 def _extract_schema_org(html: str, url: str) -> dict:
@@ -565,8 +616,7 @@ def _extract_schema_org(html: str, url: str) -> dict:
     if result:
         result["source_url"] = url
         result["extraction_method"] = "schema_org"
-        populated = _count_populated(result)
-        result["confidence_score"] = min(populated / 5.0, 1.0)
+        result["confidence_score"] = _compute_confidence(result)
 
     return result
 
@@ -823,8 +873,7 @@ def _extract_rule_based(html: str, url: str) -> dict:
     if result:
         result["source_url"] = url
         result["extraction_method"] = "rule_based"
-        populated = _count_populated(result)
-        result["confidence_score"] = min(populated / 6.0, 1.0)
+        result["confidence_score"] = _compute_confidence(result)
 
     return result
 
@@ -885,8 +934,10 @@ def _extract_with_llm_text(text: str, url: str, context: str = "", source_label:
 
         enc = tiktoken.encoding_for_model("gpt-4o-mini")
         tokens = len(enc.encode(cleaned))
-        if tokens > 400:
-            cleaned = enc.decode(enc.encode(cleaned)[:400])
+        # 1500 tokens gives the LLM enough context for rich vendor profiles
+        # (Jina markdown is clean, so 1500 tokens ≈ 1100 meaningful words)
+        if tokens > 1500:
+            cleaned = enc.decode(enc.encode(cleaned)[:1500])
 
         client = OpenAI(api_key=settings.openai_api_key)
 
@@ -942,9 +993,8 @@ def _extract_with_llm_text(text: str, url: str, context: str = "", source_label:
         if result:
             result["source_url"] = url
             result["extraction_method"] = source_label
-            populated = _count_populated(result)
-            result["confidence_score"] = min(populated / 5.0, 1.0)
-            logger.info(f"[{source_label.upper()}] Extracted {populated} fields from {url} (~{tokens} tokens in)")
+            result["confidence_score"] = _compute_confidence(result)
+            logger.info(f"[{source_label.upper()}] Extracted {_count_populated(result)} fields from {url} (~{tokens} tokens in)")
 
         return result
 
@@ -1005,8 +1055,7 @@ def _merge_vendor_data(sources: list[dict]) -> dict:
     if sources_sorted:
         merged["source_url"] = sources_sorted[0].get("source_url", "")
 
-    populated = _count_populated(merged)
-    merged["confidence_score"] = min(populated / 7.0, 1.0)
+    merged["confidence_score"] = _compute_confidence(merged)
 
     return merged
 
@@ -1155,7 +1204,9 @@ def _validate_vendor(vendor: dict) -> dict:
         if normalized:
             cleaned["country"] = normalized
         else:
-            cleaned.pop("country", None)
+            # PHASE A FIX #3: Don't discard unrecognized countries, keep as-is
+            # Better to have "Uzbekistan" than empty field
+            cleaned["country"] = country.strip()[:100]
 
     description = cleaned.get("description", "")
     if description:
@@ -1169,8 +1220,7 @@ def _validate_vendor(vendor: dict) -> dict:
         if val:
             cleaned[field] = re.sub(r'\s+', ' ', str(val)).strip()[:500]
 
-    populated = _count_populated(cleaned)
-    cleaned["confidence_score"] = min(populated / 7.0, 1.0)
+    cleaned["confidence_score"] = _compute_confidence(cleaned)
     cleaned["is_valid"] = bool(cleaned.get("name"))
 
     return cleaned
@@ -1245,21 +1295,316 @@ def validate_vendor(vendor: dict) -> dict:
     return _validate_vendor(vendor)
 
 
+# ── URL blocklist — persisted feedback loop ───────────────────────────────────
+
+import os as _os
+import threading as _threading
+
+_BLOCKLIST_PATH = _os.path.join(
+    _os.path.dirname(__file__), "..", "data", "url_blocklist.json"
+)
+_BLOCKLIST_PATH = _os.path.normpath(_BLOCKLIST_PATH)
+_blocklist_lock = _threading.Lock()
+_blocklist_patterns: set[str] = set()
+_blocklist_loaded: bool = False
+
+
+def _load_blocklist() -> None:
+    """Load blocked_path_patterns from disk into _blocklist_patterns (once per process)."""
+    global _blocklist_loaded
+    if _blocklist_loaded:
+        return
+    with _blocklist_lock:
+        if _blocklist_loaded:
+            return
+        try:
+            if _os.path.exists(_BLOCKLIST_PATH):
+                with open(_BLOCKLIST_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                patterns = data.get("blocked_path_patterns", [])
+                _blocklist_patterns.update(p for p in patterns if p and isinstance(p, str))
+                logger.debug(f"[BLOCKLIST] Loaded {len(_blocklist_patterns)} blocked patterns from disk")
+        except Exception as e:
+            logger.warning(f"[BLOCKLIST] Failed to load blocklist: {e}")
+        _blocklist_loaded = True
+
+
+def _url_is_blocked(url: str) -> bool:
+    """Return True if any known blocked pattern appears in the URL path."""
+    _load_blocklist()
+    if not _blocklist_patterns:
+        return False
+    path_lower = urlparse(url).path.lower()
+    return any(pat in path_lower for pat in _blocklist_patterns)
+
+
+def _record_blocked_url(url: str) -> None:
+    """
+    Extract the first meaningful path segment from url and persist it to the
+    blocklist if it's not already there. Thread-safe write.
+
+    Only records patterns that contain a junk keyword (appointment, booking, etc.)
+    to avoid false-positive blocking of legitimate paths.
+    """
+    _JUNK_PATH_SIGNALS = [
+        "appointment", "book-", "booking", "apply", "register-booth",
+        "event-pass", "ticket", "credential", "accreditation",
+        "reserve", "signup-event",
+    ]
+    path = urlparse(url).path.lower().strip("/")
+    if not path:
+        return
+    # Take the first non-empty path segment as the pattern
+    first_segment = path.split("/")[0] if "/" in path else path
+    if not first_segment or len(first_segment) < 4:
+        return
+    # Only add if it contains a known junk signal (don't blindly block random paths)
+    if not any(sig in first_segment for sig in _JUNK_PATH_SIGNALS):
+        return
+    if first_segment in _blocklist_patterns:
+        return
+
+    with _blocklist_lock:
+        if first_segment in _blocklist_patterns:
+            return
+        _blocklist_patterns.add(first_segment)
+        try:
+            existing: dict = {"blocked_path_patterns": []}
+            if _os.path.exists(_BLOCKLIST_PATH):
+                with open(_BLOCKLIST_PATH, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            patterns_list: list = existing.get("blocked_path_patterns", [])
+            if first_segment not in patterns_list:
+                patterns_list.append(first_segment)
+                existing["blocked_path_patterns"] = patterns_list
+                with open(_BLOCKLIST_PATH, "w", encoding="utf-8") as f:
+                    json.dump(existing, f, indent=2, ensure_ascii=False)
+                logger.info(f"[BLOCKLIST] New blocked pattern added: '{first_segment}' (from {url})")
+        except Exception as e:
+            logger.warning(f"[BLOCKLIST] Failed to persist pattern '{first_segment}': {e}")
+
+
+# ── Sitemap + pagination helpers (used by discover_vendor_urls) ───────────────
+
+_SITEMAP_NAMESPACES = [
+    "http://www.sitemaps.org/schemas/sitemap/0.9",
+    "",  # fallback: no namespace
+]
+
+_HTTPX_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
+def _sitemap_locs(xml_text: str) -> list[str]:
+    """Extract all <loc> values from a sitemap or sitemap index XML string."""
+    locs: list[str] = []
+    for ns in _SITEMAP_NAMESPACES:
+        try:
+            root = ET.fromstring(xml_text)
+            tag = f"{{{ns}}}loc" if ns else "loc"
+            locs = [el.text.strip() for el in root.iter(tag) if el.text and el.text.strip()]
+            if locs:
+                return locs
+        except ET.ParseError:
+            break
+    # Regex fallback when XML is malformed
+    locs = re.findall(r'<loc>\s*(https?://[^\s<]+)\s*</loc>', xml_text)
+    return locs
+
+
+def _fetch_sitemap_urls(
+    base_url: str,
+    base_domain: str,
+    vendor_kws: list[str],
+    nav_kws: list[str],
+    timeout: int = 8,
+) -> list[str]:
+    """
+    Try {base_url}/sitemap.xml then /sitemap_index.xml.
+    Return all <loc> URLs that:
+      - belong to base_domain
+      - contain at least one vendor keyword in the path
+      - do NOT contain any nav/junk keyword in the path
+    Follows one level of sitemap index (sub-sitemap fetch).
+    Hard timeout to keep the caller fast.
+    """
+    candidate_sitemaps = [
+        f"{base_url}/sitemap.xml",
+        f"{base_url}/sitemap_index.xml",
+        f"{base_url}/sitemap-exhibitors.xml",
+        f"{base_url}/exhibitors-sitemap.xml",
+    ]
+
+    def _is_vendor_url(loc: str) -> bool:
+        p = urlparse(loc)
+        if base_domain not in p.netloc:
+            return False
+        path_lower = p.path.lower()
+        if any(kw in path_lower for kw in nav_kws):
+            return False
+        return any(kw in path_lower for kw in vendor_kws)
+
+    def _fetch_xml(url_to_fetch: str) -> str:
+        try:
+            r = httpx.get(url_to_fetch, timeout=timeout, follow_redirects=True, headers=_HTTPX_HEADERS)
+            if r.status_code == 200 and ("<loc>" in r.text or "<urlset" in r.text or "<sitemapindex" in r.text):
+                return r.text
+        except Exception:
+            pass
+        return ""
+
+    found: list[str] = []
+    for sitemap_url in candidate_sitemaps:
+        xml_text = _fetch_xml(sitemap_url)
+        if not xml_text:
+            continue
+
+        locs = _sitemap_locs(xml_text)
+        if not locs:
+            continue
+
+        # Distinguish sitemap index (contains sub-sitemap URLs) vs leaf sitemap (contains page URLs)
+        # Heuristic: if most locs end in .xml → it's a sitemap index
+        xml_locs = [l for l in locs if l.lower().endswith(".xml")]
+        is_index = len(xml_locs) > len(locs) * 0.5
+
+        if is_index:
+            # Fetch each sub-sitemap and collect vendor URLs from them
+            for sub_url in xml_locs[:10]:  # cap at 10 sub-sitemaps to stay fast
+                sub_xml = _fetch_xml(sub_url)
+                if sub_xml:
+                    found.extend(l for l in _sitemap_locs(sub_xml) if _is_vendor_url(l))
+        else:
+            found.extend(l for l in locs if _is_vendor_url(l))
+
+        if found:
+            logger.info(f"[SITEMAP] {sitemap_url} → {len(found)} vendor candidate URLs")
+            break  # first working sitemap is enough
+
+    return list(dict.fromkeys(found))  # deduplicate, preserve order
+
+
+def _detect_pagination_urls(
+    soup: BeautifulSoup,
+    source_url: str,
+    base_parsed,
+    max_pages: int = 20,
+) -> list[str]:
+    """
+    Detect page-N links in the current page and return all discovered paginated URLs.
+
+    Recognized patterns (checked in priority order):
+      /page/2/, /page/3/            (path segment)
+      ?page=2, ?page=3              (query param)
+      ?p=2, ?p=3                    (WordPress-style)
+      ?pageNumber=2, ?PageNum=2     (generic)
+      ?start=20 (offset-style)      (inferred from first increment)
+
+    Scans all <a href> links for the highest page number, then generates
+    URLs for pages 2..max(found, max_pages) — no actual fetching here;
+    caller fetches.
+    """
+    base_url_root = f"{base_parsed.scheme}://{base_parsed.netloc}"
+    source_clean = source_url.rstrip("/")
+
+    # ── Pattern: /page/N/ in path ──────────────────────────────────────────────
+    PATH_PAGE_RE = re.compile(r'/page/(\d+)/?$', re.IGNORECASE)
+
+    # ── Pattern: ?param=N query strings ───────────────────────────────────────
+    QUERY_PAGE_PARAMS = ["page", "p", "pagenumber", "pagenum", "pg", "paged", "currentpage"]
+
+    max_page_found = 1
+    page_param_name: str = ""
+    page_param_style: str = ""   # "path" | "query"
+
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if not href or href.startswith("#") or href.startswith("javascript:"):
+            continue
+
+        # Make absolute
+        if href.startswith("/"):
+            href = base_url_root + href
+        elif not href.startswith("http"):
+            href = urljoin(source_url, href)
+
+        parsed = urlparse(href)
+        if base_parsed.netloc not in parsed.netloc:
+            continue
+
+        # Path-segment style: /page/N/
+        m = PATH_PAGE_RE.search(parsed.path)
+        if m:
+            n = int(m.group(1))
+            if n > max_page_found:
+                max_page_found = n
+                page_param_style = "path"
+            continue
+
+        # Query-param style: ?page=N
+        qs = parse_qs(parsed.query, keep_blank_values=False)
+        for param in QUERY_PAGE_PARAMS:
+            val = qs.get(param, qs.get(param.lower(), []))
+            if val and val[0].isdigit():
+                n = int(val[0])
+                if n > max_page_found:
+                    max_page_found = n
+                    page_param_name = param
+                    page_param_style = "query"
+                break
+
+    if max_page_found <= 1:
+        return []  # No pagination detected
+
+    pages_to_fetch = min(max_page_found, max_pages)
+    extra_urls: list[str] = []
+
+    # Reconstruct the base URL without any existing page param
+    base_parsed_clean = urlparse(source_url)
+    base_qs = parse_qs(base_parsed_clean.query, keep_blank_values=False)
+
+    for page_num in range(2, pages_to_fetch + 1):
+        if page_param_style == "path":
+            # Replace existing /page/N or append /page/N
+            clean_path = PATH_PAGE_RE.sub("", base_parsed_clean.path).rstrip("/")
+            new_path = f"{clean_path}/page/{page_num}/"
+            extra_urls.append(urlunparse((
+                base_parsed_clean.scheme, base_parsed_clean.netloc,
+                new_path, "", base_parsed_clean.query, "",
+            )))
+        elif page_param_style == "query" and page_param_name:
+            new_qs = dict(base_qs)
+            new_qs[page_param_name] = [str(page_num)]
+            flat_qs = {k: v[0] for k, v in new_qs.items()}
+            extra_urls.append(urlunparse((
+                base_parsed_clean.scheme, base_parsed_clean.netloc,
+                base_parsed_clean.path, "", urlencode(flat_qs), "",
+            )))
+
+    logger.info(f"[PAGINATE] Detected {pages_to_fetch} pages — style={page_param_style}")
+    return extra_urls
+
+
 @tool
 def discover_vendor_urls(url: str, max_urls: int = 100) -> list[str]:
     """
     Discover individual vendor/exhibitor profile URLs from a listing or expo page.
     The page must have been fetched first with fetch_page or fetch_pages_batch.
 
-    Strategy:
-    - Finds all same-domain internal links
-    - Scores each URL by how likely it is a vendor profile (keyword matching + pattern repetition)
-    - Returns up to max_urls ranked URLs, excluding the source URL itself
+    Strategy (in order):
+      1. Sitemap: try {base}/sitemap.xml and /sitemap_index.xml — direct URL inventory
+      2. Pagination: auto-follow /page/N, ?page=N, etc. up to 20 extra pages
+      3. Link scraping: score all same-domain internal hrefs by path keywords
+         and repetition pattern (listing grid detection)
 
-    Returns: list of candidate vendor profile URLs (strings)
+    Returns: list of candidate vendor profile URLs, ranked by relevance score
     """
     from collections import defaultdict
-    from urllib.parse import urlparse, urljoin
     from backend.tools.fetch_tools import get_cached_html
 
     html = get_cached_html(url)
@@ -1270,6 +1615,7 @@ def discover_vendor_urls(url: str, max_urls: int = 100) -> list[str]:
     soup = BeautifulSoup(html, "lxml")
     base_parsed = urlparse(url)
     base_domain = base_parsed.netloc
+    base_url_root = f"{base_parsed.scheme}://{base_domain}"
     source_path = url.rstrip("/")
 
     # Keywords that strongly suggest a vendor/exhibitor profile URL path
@@ -1285,79 +1631,117 @@ def discover_vendor_urls(url: str, max_urls: int = 100) -> list[str]:
         "login", "register", "signup", "sign-up", "contact", "about", "faq",
         "privacy", "terms", "cookie", "sitemap", "search", "tag", "category",
         "news", "blog", "press", "media", "career", "jobs", "help",
+        "appointment", "book", "apply", "register-booth", "event-pass", "ticket",
+        "pass", "credential", "accreditation", "verification", "booking", "reserve",
+        "attend", "signup-event", "registration",
+        # Organizer-internal pages (not exhibitor profiles)
+        "organizationchart", "organisation", "joinus", "join-us", "culture",
+        "abroad", "introduction", "history", "leadership", "management",
+        "investor", "shareholder", "governance", "sustainability", "csr",
+        "download", "gallery", "photo", "video", "map", "floor-plan",
+        "agenda", "schedule", "session", "speaker", "keynote", "workshop",
+        "hotel", "venue", "travel", "transport", "parking", "accommodation",
     ]
 
     def make_absolute(href: str) -> str | None:
         href = href.strip()
-        if not href or href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:") or href.startswith("javascript:"):
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
             return None
         if href.startswith("//"):
             return "https:" + href
         if href.startswith("/"):
-            return f"{base_parsed.scheme}://{base_domain}{href}"
+            return f"{base_url_root}{href}"
         if href.startswith("http"):
             return href
         return urljoin(url, href)
 
-    # Collect all internal links
+    # ── 1. Sitemap discovery ──────────────────────────────────────────────────
     candidate_scores: dict[str, int] = {}
     pattern_groups: dict[str, list[str]] = defaultdict(list)
 
-    for a in soup.find_all("a", href=True):
-        href = make_absolute(a.get("href", ""))
-        if not href:
-            continue
-        parsed = urlparse(href)
-        # Must be same domain
-        if base_domain not in parsed.netloc:
-            continue
-        # Skip source URL itself
-        if href.rstrip("/") == source_path:
-            continue
-        # Skip URLs with query strings that look like search/filter
-        if len(parsed.query) > 30:
-            continue
+    sitemap_urls = _fetch_sitemap_urls(base_url_root, base_domain, VENDOR_PATH_KEYWORDS, NAV_PATH_KEYWORDS)
+    for su in sitemap_urls:
+        clean = su.rstrip("/")
+        if clean != source_path:
+            # Score=8: high confidence — came directly from the site's own sitemap
+            candidate_scores[su] = candidate_scores.get(su, 0) + 8
 
-        path_lower = parsed.path.lower()
+    # ── 2. Pagination: collect soups for pages 2..N ───────────────────────────
+    extra_page_urls = _detect_pagination_urls(soup, url, base_parsed, max_pages=20)
+    soups_to_scan: list[BeautifulSoup] = [soup]
 
-        # Skip obvious nav/utility pages
-        if any(kw in path_lower for kw in NAV_PATH_KEYWORDS):
-            continue
+    if extra_page_urls:
+        for page_url in extra_page_urls:
+            try:
+                resp = httpx.get(page_url, timeout=10, follow_redirects=True, headers=_HTTPX_HEADERS)
+                if resp.status_code == 200 and len(resp.text) > 500:
+                    # Sanity check: page must not redirect back to page 1
+                    # (some sites return page 1 for out-of-range page numbers)
+                    extra_soup = BeautifulSoup(resp.text, "lxml")
+                    soups_to_scan.append(extra_soup)
+                else:
+                    break  # 404 or empty → stop following pages
+            except Exception:
+                break
 
-        # Score based on path keyword match
-        score = 0
-        for kw in VENDOR_PATH_KEYWORDS:
-            if kw in path_lower:
-                score += 3
+        logger.info(f"[PAGINATE] Fetched {len(soups_to_scan) - 1} additional pages for {url}")
 
-        # Detect repeated patterns (listing grid) — group by first 2 path segments
-        parts = [p for p in parsed.path.split("/") if p]
-        if len(parts) >= 2:
-            pattern_key = "/" + "/".join(parts[:2])
-        elif len(parts) == 1:
-            pattern_key = "/" + parts[0]
-        else:
-            pattern_key = "/"
+    # ── 3. Link scraping across all soups (page 1 + paginated pages) ──────────
+    for scan_soup in soups_to_scan:
+        for a in scan_soup.find_all("a", href=True):
+            href = make_absolute(a.get("href", ""))
+            if not href:
+                continue
+            parsed = urlparse(href)
+            if base_domain not in parsed.netloc:
+                continue
+            if href.rstrip("/") == source_path:
+                continue
+            # Skip overly complex query strings (search/filter params, not pagination)
+            if len(parsed.query) > 30:
+                continue
 
-        pattern_groups[pattern_key].append(href)
+            path_lower = parsed.path.lower()
+            if any(kw in path_lower for kw in NAV_PATH_KEYWORDS):
+                continue
+            # Skip URLs whose path segment is in the persisted blocklist
+            if _url_is_blocked(href):
+                continue
 
-        # Start accumulating with at least 0 score for valid internal links
-        if href not in candidate_scores:
-            candidate_scores[href] = score
+            # Score: +3 per matching vendor keyword in path
+            score = sum(3 for kw in VENDOR_PATH_KEYWORDS if kw in path_lower)
 
-    # Boost URLs that share a pattern with many others (likely a listing grid)
+            # Group by first 2 path segments for repetition detection
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) >= 2:
+                pattern_key = "/" + "/".join(parts[:2])
+            elif parts:
+                pattern_key = "/" + parts[0]
+            else:
+                pattern_key = "/"
+
+            pattern_groups[pattern_key].append(href)
+
+            if href not in candidate_scores:
+                candidate_scores[href] = score
+
+    # Boost URLs whose path prefix appears ≥3 times (listing grid pattern)
     for pattern, hrefs in pattern_groups.items():
-        if len(hrefs) >= 3:  # ≥3 URLs with same path prefix = likely individual profiles
+        if len(hrefs) >= 3:
             for href in hrefs:
                 if href in candidate_scores:
-                    candidate_scores[href] += 5  # strong listing signal
+                    candidate_scores[href] += 5
 
-    # Filter: only keep URLs with score > 0 (some signal)
-    filtered = [(href, score) for href, score in candidate_scores.items() if score > 0]
+    # Keep only URLs with at least one positive signal
+    filtered = [(href, sc) for href, sc in candidate_scores.items() if sc > 0]
     filtered.sort(key=lambda x: x[1], reverse=True)
 
     result = [href for href, _ in filtered[:max_urls]]
-    logger.info(f"[DISCOVER] {url} → {len(result)} candidate vendor URLs (from {len(candidate_scores)} total links)")
+    logger.info(
+        f"[DISCOVER] {url} → {len(result)} candidate vendor URLs "
+        f"(sitemap={len(sitemap_urls)}, pages={len(soups_to_scan)}, "
+        f"total_candidates={len(candidate_scores)})"
+    )
     return result
 
 
@@ -1854,73 +2238,100 @@ def run_extraction_pipeline(url: str, event_context: dict = None) -> dict:
 
     settings = get_settings()
     event_ctx = event_context or {}
+    context_str = event_ctx.get("event_name", "") if event_ctx else ""
 
-    result = _extract_schema_org(html, url)
-    # Check AFTER validate so bad names (e.g. "Company Profile") are caught early
-    _validated_schema = _validate_vendor(result) if _count_populated(result) >= settings.min_vendor_fields else {}
+    # ── Step 1: Schema.org / JSON-LD (zero-cost structured data) ─────────────
+    schema_result = _extract_schema_org(html, url)
+    _validated_schema = _validate_vendor(schema_result) if _count_populated(schema_result) >= settings.min_vendor_fields else {}
     if _validated_schema.get("name"):
         if event_ctx:
             _validated_schema.update({k: v for k, v in event_ctx.items() if v and not _validated_schema.get(k)})
         return _reg(_validated_schema)
 
-    rule_result = _extract_rule_based(html, url)
-    _validated_rule = _validate_vendor(_merge_vendor_data([result, rule_result])) if _count_populated(rule_result) >= settings.min_vendor_fields else {}
-    if _validated_rule.get("name"):
-        if event_ctx:
-            _validated_rule.update({k: v for k, v in event_ctx.items() if v and not _validated_rule.get(k)})
-        return _reg(_validated_rule)
+    # ── Step 2: Jina Reader → LLM ─────────────────────────────────────────────
+    # Jina fetches clean markdown from any URL — no HTML noise, no heading confusion.
+    # If Jina cannot reach the page, we return {} rather than fall back to raw HTML
+    # or rule-based (both produce garbage on listing/category pages).
+    if settings.effective_llm_enabled:
+        logger.info(f"[EXTRACT] Schema.org insufficient — Jina+LLM for {url}")
+        jina_result = _extract_with_jina_llm(url, context_str)
+        if jina_result:
+            combined = _merge_vendor_data([schema_result, jina_result]) if schema_result else jina_result
+            validated = _validate_vendor(combined)
+            if validated.get("name"):
+                if event_ctx:
+                    validated.update({k: v for k, v in event_ctx.items() if v and not validated.get(k)})
+                return _reg(validated)
 
-    # Either not enough fields OR name was a generic phrase → fall through to LLM
-    combined = _merge_vendor_data([r for r in [result, rule_result] if r])
-    # Try LLM if: not enough populated fields, OR the name is missing/empty in combined result
-    _combined_has_valid_name = bool(_validate_vendor(dict(combined)).get("name") if combined else False)
-    if _count_populated(combined) < settings.min_vendor_fields or not _combined_has_valid_name:
-        context_str = event_ctx.get("event_name", "") if event_ctx else ""
-
-        # Prefer Jina AI Reader (clean markdown → LLM) over raw HTML → LLM
-        # Jina works without API key (free, rate-limited); key only needed for higher limits
-        if settings.effective_llm_enabled:
-            logger.info(f"[EXTRACT] Rule-based insufficient — trying Jina Reader for {url}")
-            jina_result = _extract_with_jina_llm(url, context_str)
-            if jina_result:
-                combined = _merge_vendor_data([combined, jina_result])
-            else:
-                # Jina unavailable — fallback to raw HTML
-                llm_result = _extract_with_llm(html, url, context_str)
-                if llm_result:
-                    combined = _merge_vendor_data([combined, llm_result])
-
-    if event_ctx:
-        combined.update({k: v for k, v in event_ctx.items() if v and not combined.get(k)})
-
-    return _reg(_validate_vendor(combined))
+    # Jina returned nothing usable — skip rather than produce bad data
+    logger.debug(f"[EXTRACT] Jina+LLM yielded no vendor for {url} — skipping")
+    return _reg({})
 
 
 async def _llm_classify_and_extract(url: str, html: str, event_ctx: dict) -> dict:
     """
-    One LLM call that does TWO things at once:
-      1. Classify: is this page a real vendor/company profile?
-      2. If yes: extract all available company fields.
-    Returns vendor dict (with extraction_method="llm_classify") or {} if not a vendor page.
+    Fetch the page via Jina AI Reader → single LLM call that:
+      1. Classifies: is this a real vendor/company profile page?
+      2. If yes: extracts all company fields from the clean markdown.
+
+    Jina is the only text source. If Jina cannot fetch the URL (rate-limit,
+    network error, page too short), this function returns {} so the URL is
+    skipped — no raw HTML fallback, no rule-based fallback.
+
+    Returns vendor dict (extraction_method="llm_classify") or {}.
+    Language-aware: instructs LLM based on detected page language.
     """
     settings = get_settings()
     if not settings.effective_llm_enabled:
         return {}
 
+    # ── Jina AI Reader → clean markdown ───────────────────────────────────────
     try:
-        import html2text as h2t
-        converter = h2t.HTML2Text()
-        converter.ignore_links = False
-        converter.ignore_images = True
-        converter.body_width = 0
-        text = converter.handle(html)
-    except Exception:
-        text = html
+        from backend.tools.fetch_tools import _fetch_jina_markdown
+        jina_md = await _fetch_jina_markdown(url)
+    except Exception as _je:
+        logger.debug(f"[LLM-CLS] Jina fetch exception for {url}: {_je}")
+        return {}
 
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip() and len(ln.strip()) > 3]
-    cleaned = "\n".join(lines[:100])[:2500]   # ~600 tokens max
+    if not jina_md or len(jina_md) < 150:
+        logger.debug(f"[LLM-CLS] Jina returned too short content for {url} — skipping")
+        return {}
+
+    logger.debug(f"[LLM-CLS] Jina markdown: {len(jina_md):,} chars for {url}")
+
+    lines = [ln.strip() for ln in jina_md.split("\n") if ln.strip() and len(ln.strip()) > 3]
+    cleaned = "\n".join(lines[:200])[:5000]
+
+    # PHASE A FIX #2: Hard pre-filter junk pages BEFORE LLM call (save cost + time)
+    JUNK_KEYWORDS = [
+        "make an appointment", "click here to apply", "register for event",
+        "book a meeting", "apply to exhibit", "apply booth pass", "sign up for",
+        "register now", "schedule visit", "request demo", "download brochure",
+        "fill out form", "complete registration", "reserve your spot"
+    ]
+    cleaned_lower = cleaned.lower()
+    if any(junk_kw in cleaned_lower for junk_kw in JUNK_KEYWORDS):
+        logger.debug(f"[EXTRACT] {url} — pre-filtered as junk (appointment/booking page)")
+        _record_blocked_url(url)   # persist this URL's path pattern to the blocklist
+        return {}  # Skip LLM call, return empty
 
     event_name = event_ctx.get("event_name", "")
+
+    # Detect page language for language-aware extraction
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        detected_lang = _detect_lang(soup)
+    except Exception:
+        detected_lang = "unknown"
+
+    # Enhanced system prompt with language awareness
+    lang_note = ""
+    if detected_lang == "zh":
+        lang_note = "\n[NOTE: This page may be in Chinese. Accept Chinese company names, characters, and text.]"
+    elif detected_lang == "ru":
+        lang_note = "\n[NOTE: This page may be in Russian. Accept Russian company names, Cyrillic text, and Russian formats.]"
+    elif detected_lang != "unknown" and detected_lang != "en":
+        lang_note = f"\n[NOTE: This page may be in {detected_lang.upper()}. Accept company names and text in this language.]"
 
     system = (
         "You are a vendor data extractor for a trade-show exhibitor database.\n\n"
@@ -1930,11 +2341,12 @@ async def _llm_classify_and_extract(url: str, html: str, event_ctx: dict) -> dic
         "organizer page, government page, generic topic page\n\n"
         "STEP 2 — If VENDOR: extract every available field into JSON.\n"
         "  Fields: name, website, email, phone, address, city, country, category, "
-        "description, linkedin, twitter, booth_number, and any other relevant field.\n\n"
+        "description, linkedin, twitter, booth_number, company_size, founded_year, and any other relevant field.\n\n"
         "STEP 3 — Return ONLY valid JSON:\n"
         "  If VENDOR  → {\"name\": \"...\", \"website\": \"...\", ...}\n"
         "  If NOT_VENDOR → {}\n\n"
         "No explanation. No markdown. Pure JSON only."
+        + lang_note
     )
     user = f"URL: {url}\nEvent: {event_name}\n\nPage content:\n{cleaned}"
 
@@ -1947,7 +2359,7 @@ async def _llm_classify_and_extract(url: str, html: str, event_ctx: dict) -> dic
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_completion_tokens": 600,
+            "max_completion_tokens": 1200,   # raised: Jina gives richer input → need more output budget
         }
         if settings.model_supports_temperature:
             kwargs["temperature"] = 0.0
@@ -1957,6 +2369,8 @@ async def _llm_classify_and_extract(url: str, html: str, event_ctx: dict) -> dic
         content = (response.choices[0].message.content or "").strip()
 
         if not content or content in ("{}", "{ }"):
+            # LLM classified as NOT_VENDOR — record path pattern if junk-signal present
+            _record_blocked_url(url)
             return {}
 
         try:
@@ -1966,6 +2380,7 @@ async def _llm_classify_and_extract(url: str, html: str, event_ctx: dict) -> dic
             raw = json.loads(m.group(0)) if m else {}
 
         if not raw:
+            _record_blocked_url(url)
             return {}
 
         _SKIP = {"source_url", "extraction_method", "confidence_score"}
@@ -1978,7 +2393,7 @@ async def _llm_classify_and_extract(url: str, html: str, event_ctx: dict) -> dic
         if result:
             result["source_url"] = url
             result["extraction_method"] = "llm_classify"
-            result["confidence_score"] = min(_count_populated(result) / 5.0, 1.0)
+            result["confidence_score"] = _compute_confidence(result)
 
         return result
 
@@ -2056,7 +2471,9 @@ async def extract_all_vendor_profiles(
                 register_vendor(v_schema)
                 return v_schema
 
-            # ── 3. LLM classify + extract (primary, not fallback) ─────────────
+            # ── 3. Jina+LLM classify + extract (primary, replaces rule_based) ──
+            # Rule-based extraction is intentionally omitted — it cannot separate
+            # a vendor name from an event heading. Jina+LLM handles all cases.
             if settings.effective_llm_enabled:
                 llm_result = await _llm_classify_and_extract(url, html, ctx)
                 if llm_result:
@@ -2066,15 +2483,6 @@ async def extract_all_vendor_profiles(
                             validated.update({k: v for k, v in ctx.items() if v and not validated.get(k)})
                         register_vendor(validated)
                         return validated
-
-            # ── 4. rule_based supplement only (last resort, no LLM) ───────────
-            rule = _extract_rule_based(html, url)
-            v_rule = _validate_vendor(_merge_vendor_data([schema, rule])) if _count_populated(rule) >= 3 else {}
-            if v_rule.get("name"):
-                if ctx:
-                    v_rule.update({k: v for k, v in ctx.items() if v and not v_rule.get(k)})
-                register_vendor(v_rule)
-                return v_rule
 
             return None
 
@@ -2107,12 +2515,175 @@ async def extract_all_vendor_profiles(
     }
 
 
+@tool
+async def extract_vendors_from_listing(
+    url: str,
+    event_context: str = "{}",
+) -> dict:
+    """
+    Batch-extract ALL vendors/exhibitors from a listing/directory page.
+
+    Menggunakan Jina AI Reader (otomatis render JavaScript) + LLM untuk mengekstrak
+    SETIAP exhibitor yang muncul di halaman — dengan SEMUA field yang tersedia secara
+    dinamis (booth_number, pavilion, country, category, products, website, dll).
+    Tidak terpaku pada schema tetap — kuliti semuanya!
+
+    GUNAKAN INI untuk:
+    - Halaman daftar exhibitor/peserta (listing pages)
+    - Situs JS-heavy / React / Vue (Jina otomatis render)
+    - Direktori perusahaan / halaman participants
+
+    Berbeda dari extract_all_vendor_profiles (butuh URL profil individual per vendor),
+    tool ini langsung ekstrak semua dari halaman listing dalam 1 LLM call.
+
+    event_context: JSON string dengan key event_name, event_location, event_date (opsional).
+    Returns: {"vendors_found": N, "total_in_registry": M, "is_listing_page": true/false}
+    """
+    from backend.tools.fetch_tools import _fetch_jina_markdown
+    from backend.tools.vendor_registry import register_vendors, get_count
+
+    settings = get_settings()
+
+    # Parse event context
+    ctx: dict = {}
+    if isinstance(event_context, str) and event_context.strip():
+        try:
+            ctx = json.loads(event_context)
+        except Exception:
+            pass
+    elif isinstance(event_context, dict):
+        ctx = event_context
+
+    event_name = ctx.get("event_name", "")
+
+    # Fetch via Jina (renders JavaScript, returns clean markdown)
+    logger.info(f"[LISTING] Fetching via Jina: {url}")
+    jina_md = await _fetch_jina_markdown(url)
+
+    if not jina_md or len(jina_md) < 200:
+        logger.warning(f"[LISTING] Jina returned too short content for {url}")
+        return {
+            "vendors_found": 0,
+            "total_in_registry": get_count(),
+            "is_listing_page": False,
+            "error": "Jina content too short or empty",
+        }
+
+    logger.info(f"[LISTING] Got {len(jina_md):,} chars from Jina for {url}")
+
+    # Truncate to token budget (listing pages can be huge — 300 lines or 8000 chars)
+    lines = [ln.strip() for ln in jina_md.split("\n") if ln.strip() and len(ln.strip()) > 2]
+    content = "\n".join(lines[:300])[:8000]
+
+    if not settings.effective_llm_enabled:
+        return {
+            "vendors_found": 0,
+            "total_in_registry": get_count(),
+            "is_listing_page": False,
+            "error": "LLM disabled",
+        }
+
+    system = (
+        "You are extracting ALL vendors/exhibitors from an expo or event directory page.\n\n"
+        "TASK:\n"
+        "1. Determine: is this a vendor/exhibitor LISTING page? (multiple companies shown)\n"
+        "2. If YES: extract EVERY company shown — capture ALL available information per company.\n"
+        "   Include every field you can find — do NOT limit to a fixed schema. Examples:\n"
+        "   name, website, email, phone, country, city, address, booth_number, pavilion,\n"
+        "   hall, stand_number, category, product_lines, products, description,\n"
+        "   certifications, contact_person, social_media, founded_year, company_size,\n"
+        "   pavilion_zone, product_scope, representative, and any other visible field.\n\n"
+        "3. Return ONLY this JSON (no explanation, no markdown):\n"
+        '   {"is_vendor_listing": true, "vendors": [{"name": "...", "country": "...", ...}, ...]}\n'
+        "   OR if NOT a listing page:\n"
+        '   {"is_vendor_listing": false, "vendors": []}\n\n'
+        "IMPORTANT: name is required for each vendor entry. "
+        "Omit vendors with no identifiable company name."
+    )
+    user = f"URL: {url}\nEvent: {event_name}\n\nPage content:\n{content}"
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        kwargs: dict = {
+            "model": settings.openai_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_completion_tokens": 4000,
+        }
+        if settings.model_supports_temperature:
+            kwargs["temperature"] = 0.0
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = await client.chat.completions.create(**kwargs)
+        content_str = (response.choices[0].message.content or "").strip()
+
+        if not content_str:
+            return {"vendors_found": 0, "total_in_registry": get_count(), "is_listing_page": False}
+
+        try:
+            data = json.loads(content_str)
+        except json.JSONDecodeError:
+            m = re.search(r"\{[\s\S]*\}", content_str)
+            data = json.loads(m.group(0)) if m else {}
+
+        is_listing = bool(data.get("is_vendor_listing", False))
+        raw_vendors = data.get("vendors", [])
+
+        if not is_listing or not raw_vendors:
+            logger.info(f"[LISTING] {url} → not a listing page or no vendors found (is_listing={is_listing})")
+            return {"vendors_found": 0, "total_in_registry": get_count(), "is_listing_page": is_listing}
+
+        # Normalize keys and validate vendors
+        valid_vendors: list[dict] = []
+        for raw in raw_vendors:
+            if not isinstance(raw, dict):
+                continue
+            vendor: dict = {}
+            for k, v in raw.items():
+                k_norm = re.sub(r"[^a-z0-9_]", "_", k.lower().strip()).strip("_")
+                if k_norm and v and str(v).strip():
+                    vendor[k_norm] = str(v).strip()[:2000]
+            if not vendor.get("name"):
+                continue
+            # Inject event context fields (don't overwrite vendor's own data)
+            if ctx:
+                vendor.update({k: v for k, v in ctx.items() if v and not vendor.get(k)})
+            vendor["source_url"] = url
+            vendor["extraction_method"] = "listing_jina_llm"
+            vendor["confidence_score"] = _compute_confidence(vendor)
+            valid_vendors.append(vendor)
+
+        if valid_vendors:
+            total = register_vendors(valid_vendors)
+            logger.info(f"[LISTING] {url} → {len(valid_vendors)} vendors registered, registry={total}")
+            return {
+                "vendors_found": len(valid_vendors),
+                "total_in_registry": total,
+                "is_listing_page": True,
+            }
+
+        return {"vendors_found": 0, "total_in_registry": get_count(), "is_listing_page": True}
+
+    except Exception as e:
+        logger.warning(f"[LISTING] LLM error for {url}: {e}")
+        return {
+            "vendors_found": 0,
+            "total_in_registry": get_count(),
+            "is_listing_page": False,
+            "error": str(e),
+        }
+
+
 from backend.tools.vendor_registry import get_vendor_count
 from backend.tools.dynamic_parser_tool import generate_and_run_parser
 
 ALL_EXTRACT_TOOLS = [
     run_extraction_pipeline,
     extract_all_vendor_profiles,
+    extract_vendors_from_listing,
     discover_vendor_urls,
     extract_vendors_from_pdf,
     get_vendor_count,
